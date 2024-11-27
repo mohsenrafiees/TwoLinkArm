@@ -1,0 +1,50 @@
+{
+    "world": {
+        "width": 300,
+        "height": 300,
+        "robot_origin": [150, 150],
+        "obstacles": [
+            {
+                "shape": "rectangle",
+                "position": [-150, -150],
+                "size": [300, 10]
+            },
+            {
+                "shape": "rectangle",
+                "position": [-150, 140],
+                "size": [300, 10]
+            },
+            {
+                "shape": "rectangle",
+                "position": [-150, -150],
+                "size": [10, 300]
+            },
+            {
+                "shape": "rectangle",
+                "position": [140, -150],
+                "size": [10, 300]
+            },
+            {
+                "shape": "circle",
+                "position": [50.0, 50.0],
+                "size": 20.0
+            }
+        ]
+    },
+    "robot": {
+        "link_lengths": [75.0, 50.0],
+        "joint_limits": [-6.28319, 6.28319],
+        "max_velocity": 15,
+        "max_acceleration": 50,
+        "dt": 0.033
+    },
+    "visualizer": {
+        "colors": {
+            "background": [255, 255, 255],
+            "robot": [0, 0, 0],
+            "goal": [255, 0, 0],
+            "obstacle": [0, 0, 0],
+            "success_text": [0, 128, 0]
+        }
+    }
+}
