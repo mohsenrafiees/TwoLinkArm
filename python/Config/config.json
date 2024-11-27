@@ -36,7 +36,11 @@
         "joint_limits": [-6.28319, 6.28319],
         "max_velocity": 15,
         "max_acceleration": 50,
-        "dt": 0.033
+        "velocity_resolution": 3,
+        "dt": 0.033,
+        "theta_0_resolution": 0.5,
+        "theta_1_resolution": 0.5,
+        "base_radius": 10
     },
     "visualizer": {
         "colors": {
