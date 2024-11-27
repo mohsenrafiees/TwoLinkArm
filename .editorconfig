@@ -1,0 +1,26 @@
+# EditorConfig helps developers define and maintain consistent
+# coding styles between different editors and IDEs
+# http://editorconfig.org
+
+# top-most EditorConfig file
+root = true
+
+# Unix-style newlines with a newline ending every file
+[*]
+end_of_line = lf
+insert_final_newline = true
+charset = utf-8
+
+# 4 space indentation
+[*.py]
+indent_style = space
+indent_size = 4
+
+[*.{json,json5,js,ts,jsx,tsx,html}]
+indent_style = tab
+indent_size = 2
+
+# Matches the exact files either package.json or any .yml
+[{**/package.json,*.yml,*.yaml}]
+indent_style = space
+indent_size = 2
