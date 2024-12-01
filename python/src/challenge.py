@@ -1508,6 +1508,261 @@ class SBPLLatticePlanner(GridBasedPlanner):
         return delta_theta + delta_omega  # You can adjust weights if needed
 
 
+import numpy as np
+from typing import List, Tuple, Optional
+from dataclasses import dataclass
+
+class MPCController:
+    """Model Predictive Controller for 2-link robotic arm"""
+    def __init__(self, robot, constants):
+        self.robot = robot
+        self.constants = constants
+        self.h = 0.1716  # Prediction horizon
+        self.dt = constants.DT
+        self.zeta = 0.9  # Damping ratio
+        self.w0 = 4.0  # Natural frequency - should be tuned
+        self.path = []  # Store reference path
+        self.path_index = 0  # Current path index
+        
+        # Compute controller gains based on provided equations
+        self.k1 = 2 / (self.h**2 + 4*self.get_rho())
+        self.k2 = (2*self.h**2 + 4*self.get_rho()) / (self.h**3 + 4*self.get_rho()*self.h)
+
+        print(f"\nMPC Controller Initialized:")
+        print(f"Horizon: {self.h}, DT: {self.dt}")
+        print(f"Controller gains - k1: {self.k1:.3f}, k2: {self.k2:.3f}")
+        
+        # Initialize state histories
+        self.theta_ref_history = []
+        self.theta_actual_history = []
+        self.v_history = []
+        self.tau_history = []
+
+    def get_rho(self) -> float:
+        """Compute weight factor ρ based on given equation"""
+        w0h = self.w0 * self.h
+        rho = (2 - w0h**2) / (4 * self.w0**2)
+        print(f"Computed rho: {rho:.3f}")
+        return rho
+
+    def compute_feedback_linearization(self, theta: Tuple[float, float], 
+                                    theta_dot: Tuple[float, float],
+                                    v: Tuple[float, float]) -> Tuple[float, float]:
+        """Compute feedback linearization control law with debugging"""
+        print("\nComputing Feedback Linearization:")
+        print(f"Current state - theta: {theta}, theta_dot: {theta_dot}")
+        print(f"Synthetic control input v: {v}")
+        
+        # Get dynamics matrices
+        M, C, G = self.robot.compute_dynamics(theta[0], theta[1], 
+                                            theta_dot[0], theta_dot[1])
+        
+        print("\nDynamics matrices:")
+        print(f"M:\n{M}")
+        print(f"C:\n{C}")
+        print(f"G:\n{G}")
+        
+        # Compute torque using feedback linearization
+        tau = M @ np.array(v) + C @ np.array(theta_dot) + G
+        
+        print(f"Computed torques: {tau}")
+        return tau[0], tau[1]
+
+    def compute_synthetic_control(self, theta_ref: Tuple[float, float],
+                                theta: Tuple[float, float],
+                                theta_dot: Tuple[float, float]) -> Tuple[float, float]:
+        """Compute synthetic control vector v with debugging"""
+        print("\nComputing Synthetic Control:")
+        print(f"Reference theta: {theta_ref}")
+        print(f"Current theta: {theta}")
+        print(f"Current theta_dot: {theta_dot}")
+        
+        # Compute control for each joint
+        v1 = self.k1 * (theta_ref[0] - theta[0]) - self.k2 * theta_dot[0]
+        v2 = self.k1 * (theta_ref[1] - theta[1]) - self.k2 * theta_dot[1]
+        
+        print(f"Position errors: ({theta_ref[0] - theta[0]:.3f}, {theta_ref[1] - theta[1]:.3f})")
+        print(f"Computed synthetic controls: v1={v1:.3f}, v2={v2:.3f}")
+        
+        return v1, v2
+
+    def predict_trajectory(self, current_state: Tuple[float, float, float, float],
+                         control_sequence: List[Tuple[float, float]]) -> List[Tuple[float, float]]:
+        """Predict system trajectory over horizon"""
+        trajectory = []
+        state = list(current_state)
+        
+        for v in control_sequence:
+            # Simulate system dynamics
+            tau = self.compute_feedback_linearization(
+                (state[0], state[1]),
+                (state[2], state[3]),
+                v
+            )
+            
+            # Update state using robot dynamics
+            alpha_0, alpha_1 = self.robot.forward_dynamics(
+                state[0], state[1],
+                state[2], state[3],
+                tau[0], tau[1]
+            )
+            
+            # Euler integration
+            state[2] += alpha_0 * self.dt  # Update velocities
+            state[3] += alpha_1 * self.dt
+            state[0] += state[2] * self.dt  # Update positions
+            state[1] += state[3] * self.dt
+            
+            trajectory.append((state[0], state[1]))
+            
+        return trajectory
+
+    def optimize_control_sequence(self, current_state: Tuple[float, float, float, float],
+                                reference_trajectory: List[Tuple[float, float]], steps_in_horizon: int) -> List[Tuple[float, float]]:
+        """Optimize control sequence over prediction horizon"""
+        # Initialize control sequence
+        control_sequence = []
+        
+        """Optimize control sequence with debugging"""
+        print("\nOptimizing Control Sequence:")
+        print(f"Current state: {current_state}")
+        print(f"Reference trajectory length: {len(reference_trajectory)}")
+        
+        control_sequence = []
+        
+        for i in range(steps_in_horizon):
+            print(f"\nOptimization step {i}:")
+            
+            if i < len(reference_trajectory):
+                ref = reference_trajectory[i]
+            else:
+                ref = reference_trajectory[-1]
+            
+            print(f"Reference point: {ref}")
+            
+            # Compute control for this step
+            v = self.compute_synthetic_control(
+                ref,
+                (current_state[0], current_state[1]),
+                (current_state[2], current_state[3])
+            )
+            
+            control_sequence.append(v)
+            print(f"Computed control: {v}")
+        
+        return control_sequence
+
+    def step(self, theta_ref: Tuple[float, float], robot) -> Tuple[float, float]:
+        """Execute one control step"""
+        print("\n=== MPC Step Execution ===")
+
+        # Current state
+        current_state = (robot.theta_0, robot.theta_1, robot.omega_0, robot.omega_1)
+        print(f"Current state: θ0={robot.theta_0:.3f}, θ1={robot.theta_1:.3f}, ω0={robot.omega_0:.3f}, ω1={robot.omega_1:.3f}")
+        print(f"Reference state: θ0={theta_ref[0]:.3f}, θ1={theta_ref[1]:.3f}")
+        
+        # Generate reference trajectory over time horizon
+        reference_trajectory = []
+        current_path_index = self.get_current_path_index()
+        
+        # Calculate how many path indices correspond to the time horizon
+        # h is time horizon in seconds, dt is timestep, so h/dt gives number of steps
+        steps_in_horizon = int(self.h / self.dt)
+
+        print(f"\nGenerating reference trajectory:")
+        print(f"Current path index: {current_path_index}")
+        print(f"Steps in horizon: {steps_in_horizon}")
+        print(f"horizon(s): {self.h}")
+        print(f"Path length: {len(self.path)}")
+        
+        # Fill reference trajectory with bounds checking
+        for i in range(steps_in_horizon):
+            path_idx = min(current_path_index + i, len(self.path) - 1)
+            
+            if path_idx < len(self.path):
+                ref_state = self.path[path_idx]
+                reference_trajectory.append((ref_state.theta_0, ref_state.theta_1))
+                print(f"Reference point {i}: θ0={ref_state.theta_0:.3f}, θ1={ref_state.theta_1:.3f}")
+        # Optimize control sequence
+        control_sequence = self.optimize_control_sequence(current_state, reference_trajectory, steps_in_horizon)
+        
+        # Take first control action
+        v = control_sequence[1]
+        print(f"\nSelected control action: v={v}")
+        
+        # Compute torques
+        tau = self.compute_feedback_linearization(
+            (robot.theta_0, robot.theta_1),
+            (robot.omega_0, robot.omega_1),
+            v
+        )
+        
+        print(f"Final computed torques: τ0={tau[0]:.3f}, τ1={tau[1]:.3f}")
+        
+        
+        # Store history
+        self.theta_ref_history.append(theta_ref)
+        self.theta_actual_history.append((robot.theta_0, robot.theta_1))
+        self.v_history.append(v)
+        self.tau_history.append(tau)
+        
+        return tau
+
+    def reset(self):
+        """Reset controller state"""
+        self.theta_ref_history = []
+        self.theta_actual_history = []
+        self.v_history = []
+        self.tau_history = []
+        self.path_index = 0
+
+    def set_path(self, path: List[State]):
+        """Set the reference path for the controller"""
+        self.path = path
+        self.path_index = 0
+
+    def set_path_index(self, path_index: int):
+        self.path_index = path_index
+
+    def get_current_path_index(self) -> int:
+        """Get current path index with bounds checking"""
+        return min(self.path_index, len(self.path) - 1) if self.path else 0
+
+    def update_path_index(self, robot):
+        """Update path index based on tracking progress"""
+        if not self.path:
+            return
+
+        current_pos = robot.joint_2_pos()
+        
+        # Look ahead window
+        look_ahead = min(10, len(self.path) - self.path_index)
+        min_dist = float('inf')
+        best_idx = self.path_index
+        
+        # Find closest point on path within look-ahead window
+        for i in range(self.path_index, self.path_index + look_ahead):
+            if i >= len(self.path):
+                break
+                
+            path_pos = robot.forward_kinematics(
+                self.path[i].theta_0,
+                self.path[i].theta_1
+            )
+            
+            dist = np.hypot(current_pos[0] - path_pos[0],
+                          current_pos[1] - path_pos[1])
+            
+            if dist < min_dist:
+                min_dist = dist
+                best_idx = i
+        
+        # Update index if making forward progress
+        if best_idx > self.path_index:
+            self.path_index = best_idx
+
+
+
 class Controller:
     def __init__(self, constants: RobotConstants, world: World, planner: Planner) -> None:
         self.constants = constants
@@ -1515,6 +1770,10 @@ class Controller:
         self.planner = planner
         self.path: List[State] = []
         self.path_index = 0
+
+        # Initialize MPC controller
+        self.mpc = MPCController(None, constants)  # Robot will be set in set_goal
+        
         
         # Initialize trajectory tracking variables
         self.reference_theta_0: List[float] = []
@@ -1532,20 +1791,7 @@ class Controller:
         self.actual_alpha_0: List[float] = []
         self.actual_alpha_1: List[float] = []
         
-        # Enhanced PID control
-        self.prev_theta_error_0 = 0.0
-        self.prev_theta_error_1 = 0.0
-        self.integral_error_0 = 0.0
-        self.integral_error_1 = 0.0
-        self.max_integral = 2000.0  # Anti-windup limit
-        self.integral_window = deque(maxlen=100)  # Moving window for integral
         
-        # Adaptive gains
-        self.base_kp = 25.0  # Position gain - increased for better tracking
-        self.base_kd = 1.2 # Velocity gain - increased for better damping
-        self.base_ki = 0.5  # Integral gain - slightly increased
-        self.feedforward_gain = 0.6  # Feedforward compensation - full feedforward
-
         # Add debug helper
         self.debug_helper = DebugHelper(debug=True)
 
@@ -1556,6 +1802,9 @@ class Controller:
         
         start_pos = robot.joint_2_pos()
         self.goal = goal
+
+        # Update robot reference in MPC controller
+        self.mpc.robot = robot
         
         # Get path from planner
         try:
@@ -1569,15 +1818,6 @@ class Controller:
                 delta_theta1 = abs(path[i].theta_1 - path[i-1].theta_1)
                 if delta_theta0 > 0.1 or delta_theta1 > 0.1:
                     self.debug_helper.log_state(f"Warning: Large path discontinuity at index {i}")
-                
-           # Ensure path starts at current position
-            current_state = State(robot.theta_0, robot.theta_1, robot.omega_0, robot.omega_1)
-            if len(path) > 0 and not np.allclose(
-                [path[0].theta_0, path[0].theta_1],
-                [robot.theta_0, robot.theta_1],
-                atol=1e-3
-            ):
-                path.insert(0, current_state)
             
             # Extract reference trajectories with validation
             self.reference_theta_0 = []
@@ -1610,6 +1850,7 @@ class Controller:
                     self.debug_helper.log_state(f"Skipping invalid state: {state}")
                     
             self.path = path
+            self.mpc.set_path(path)
             self.path_index = 0
             
             # Reset controller states
@@ -1628,30 +1869,35 @@ class Controller:
             return self._handle_empty_path(robot)
             
         try:
-            dt = self.constants.DT
+            # Get reference state from path
+            ref_state = self.path[self.path_index]
+            theta_ref = (ref_state.theta_0, ref_state.theta_1)
             
-            # Get current state and compute errors
-            current_state = self._compute_current_state(robot)
-            errors = self._compute_tracking_errors(current_state, robot)
+            # Compute control action using MPC
+            tau_0, tau_1 = self.mpc.step(theta_ref, robot)
             
+            # Apply torques and update robot state
+            alpha_0, alpha_1 = robot.forward_dynamics(
+                robot.theta_0, robot.theta_1,
+                robot.omega_0, robot.omega_1,
+                tau_0, tau_1
+            )
             
-            # Compute and apply control
-            control_output = self._compute_control_action(errors, robot)
+            # Update velocities
+            robot.omega_0 += alpha_0 * self.constants.DT
+            robot.omega_1 += alpha_1 * self.constants.DT
             
-            # Debug: Print detailed step information
-            self.debug_helper.print_step_details(self, robot, {
-                'errors': errors,
-                'control': control_output,
-                'path_progress': f"{self.path_index}/{len(self.path)}"
-            })
-            robot = self._apply_control(control_output, robot)
+            # Update positions
+            robot.theta_0 += robot.omega_0 * self.constants.DT
+            robot.theta_1 += robot.omega_1 * self.constants.DT
+
             
             # Store actual values and update path index
             self._update_tracking_history(robot)
             self._update_path_index(robot)
             
             # Periodic debugging analysis (every 100 steps)
-            if len(self.actual_theta_0) % 100 == 0:
+            if len(self.actual_theta_0) % 1000 == 0:
                 self._perform_debug_analysis(robot)
             
         except Exception as e:
@@ -1665,7 +1911,6 @@ class Controller:
         # Reset integral terms
         self.integral_error_0 = 0.0
         self.integral_error_1 = 0.0
-        self.integral_window.clear()
         
         # Reset previous errors
         self.prev_theta_error_0 = 0.0
@@ -1703,13 +1948,24 @@ class Controller:
         # Use moving average for integral
         if self.integral_window:
             integral = np.mean(self.integral_window) * dt
+        
         # Use back-calculation anti-windup
         if abs(integral) > self.max_integral:
             gain = 0.5  # Back-calculation gain
             integral = integral - gain * (abs(integral) - self.max_integral) * np.sign(integral)
+
+        integral_zone = 0.2  # Only integrate when error is small
+        if abs(error) < integral_zone:
+            integral = integral + error * dt
+            
+        # Implement sliding anti-windup
+        if abs(integral) > self.max_integral:
+            integral = integral * 0.95  # Gradual reduction
+            
+            return np.clip(integral, -self.max_integral, self.max_integral)
         
         # Apply anti-windup
-        return np.clip(integral + error * dt, -self.max_integral, self.max_integral)
+        return np.clip(integral, -self.max_integral, self.max_integral)
 
     def _compute_adaptive_gain(self, base_gain: float, error: float) -> float:
         """Compute adaptive gain based on error"""
@@ -1858,11 +2114,11 @@ class Controller:
                     closest_idx = i
             
             # Only update if we're making forward progress and joint-space distance is reasonable
-            if closest_idx > self.path_index and min_dist < np.pi/2:  # Half pi as max acceptable deviation
+            if closest_idx > self.path_index: #and min_dist < np.pi/2:  # Half pi as max acceptable deviation
                 self.path_index = closest_idx
             else:
-                # If no better point found, make conservative progress
-                self.path_index = min(self.path_index + 1, len(self.path) - 1)
+                # If no better point found, stay at current point
+                self.path_index = min(self.path_index, len(self.path) - 1)
                 
             # Debug: Print path update information
             if closest_idx > self.path_index:
@@ -1873,10 +2129,12 @@ class Controller:
             if min_dist > 0.5:  # About 30 degrees total deviation
                 self.debug_helper.log_state(f"Large joint-space tracking error: {min_dist:.3f} rad")
                 
+            self.mpc.set_path_index(self.path_index)
         except Exception as e:
             # Fallback: conservative increment with bounds check
             self.debug_helper.log_state(f"Error in path index update: {str(e)}")
             self.path_index = min(self.path_index, len(self.path) - 1)
+            self.mpc.set_path_index(self.path_index)
 
     def _compute_lookahead_distance(self, robot: Robot) -> float:
         """Compute adaptive lookahead distance with improved scaling"""
@@ -2605,7 +2863,6 @@ def main() -> None:
     min_distance = robot_constants.LINK_1  # For example, minimum distance is the length of the first link
     random_rectangle_obstacle = generate_random_rectangle_obstacle(workspace_size, min_distance)
     obstacles.append(random_rectangle_obstacle)
-    obstacles =[]
     # Initialize world
     world = World(
         config['world']['width'],
