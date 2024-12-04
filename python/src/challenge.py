@@ -7,12 +7,28 @@ import heapq
 import time
 from collections import deque
 import itertools
+import scipy.integrate
 
 from collision_checker import CollisionChecker
 from utils import generate_random_goal, generate_random_rectangle_obstacle
 from obstacle import Obstacle
 from dataclasses import dataclass
+from enum import Enum
 
+class TrajectoryType(Enum):
+    ACCELERATION = 'acceleration'
+    DECELERATION = 'deceleration'
+
+
+@dataclass
+class PathPoint:
+    s: float  # Path parameter
+    theta_0: float  # Joint angle 1
+    theta_1: float  # Joint angle 2
+    dtheta_0: float  # First derivative of theta_0 with respect to s
+    dtheta_1: float  # First derivative of theta_1 with respect to s
+    ddtheta_0: float  # Second derivative of theta_0 with respect to s
+    ddtheta_1: float  # Second derivative of theta_1 with respect to s
 
 @dataclass(frozen=True)
 class State:
@@ -47,7 +63,7 @@ class RobotConstants:
         # Discretization parameters for planners
         self.THETA_0_RESOLUTION = config.get('theta_0_resolution', 0.1)
         self.THETA_1_RESOLUTION = config.get('theta_1_resolution', 0.1)
-        self.CONSIDER_GRAVITY = config.get('consider_gravity', False)
+        self.CONSIDER_GRAVITY = config.get('consider_gravity', True)
 
     def min_reachable_radius(self) -> float:
         return max(self.LINK_1 - self.LINK_2, 0)
@@ -80,6 +96,8 @@ class Robot:
         self.m2 = 1.5  # Mass of link 2
         self.I1 = self.m1 * constants.LINK_1**2 / 12  # Inertia of link 1
         self.I2 = self.m2 * constants.LINK_2**2 / 12  # Inertia of link 2
+
+        self.debug_helper = DebugHelper(debug=True)
 
     @property
     def theta_0(self) -> float:
@@ -252,6 +270,8 @@ class World:
         self.robot_origin = robot_origin
         self.obstacles = obstacles if obstacles is not None else []
 
+        self.debug_helper = DebugHelper(debug=True)
+
     def convert_to_display(self, point: Tuple[float, float]) -> Tuple[int, int]:
         """
         Converts robot coordinates to display coordinates for rendering.
@@ -290,6 +310,8 @@ class Visualizer:
             'reference': (0, 255, 0),
             'actual': (255, 0, 0)
         }
+
+        self.debug_helper = DebugHelper(debug=True)
 
     def display_world(self, goal: Tuple[float, float]) -> None:
         """
@@ -585,8 +607,8 @@ class GridBasedPlanner(Planner):
         self.resolutions = (self.constants.THETA_0_RESOLUTION, self.constants.THETA_1_RESOLUTION)
         self.collision_cache: Dict[State, bool] = {}
         self.max_cache_size = 10000
-        self.planning_timeout = 25.0
-        self.progress_timeout = 5.0
+        self.planning_timeout = 30.0
+        self.progress_timeout = 15.0
         self.min_progress_threshold = 0.1  
         self.max_explored_states = 10000
 
@@ -727,15 +749,234 @@ class AStarPlanner(GridBasedPlanner):
     """
     Optimized A* planner for the 2-link robotic arm.
     """
-    def __init__(self, robot, world):
+    def __init__(self, robot, world, mode='kinodynamic'):
         super().__init__(robot, world)
+        self.mode = mode  # 'kinodynamic' or 'coarse'
         self.velocity_resolution = self.constants.VELOCITY_RESOLUTION
         self.max_smoothing_error = 0.1  # Maximum allowed deviation during smoothing
         self.min_path_points = 5  # Minimum points to maintain path fidelity
-        self.motion_primitives = self._generate_motion_primitives()
+        self.motion_primitives = self._generate_motion_primitives() if mode == 'kinodynamic' else None
+        self.last_progress_time = 0
+
+        # Smoothness parameters
+        self.max_jerk = self.constants.MAX_JERK  # Maximum allowed jerk
+        self.smoothing_window = 5  # Window size for smoothing
+        self.min_velocity_threshold = 0.1  # Minimum velocity for smoothing
+        self.acceleration_weight = 0.3  # Weight for acceleration cost
+        self.jerk_weight = 0.2  # Weight for jerk cost
+        
+        # Add debug helper
+        self.debug_helper = DebugHelper(debug=True)
 
 
 
+    def set_mode(self, mode: str) -> None:
+        """Switch between planning modes"""
+        if mode not in ['kinodynamic', 'coarse']:
+            raise ValueError("Mode must be either 'kinodynamic' or 'coarse'")
+        self.mode = mode
+        self.motion_primitives = self._generate_motion_primitives() if mode == 'kinodynamic' else None
+
+    def get_neighbors_coarse(self, current_state: State) -> List[State]:
+        """Get neighbors for coarse planning with improved adaptive step size and directional sampling"""
+        neighbors = []
+        
+        # Get current end-effector position and goal position
+        current_pos = self.robot.forward_kinematics(current_state.theta_0, current_state.theta_1)
+        goal_pos = self.robot.forward_kinematics(self.goal_state.theta_0, self.goal_state.theta_1)
+        
+        # Compute distance to goal
+        dist_to_goal = np.hypot(current_pos[0] - goal_pos[0], current_pos[1] - goal_pos[1])
+        
+        # More adaptive resolution based on distance to goal
+        base_resolution = self.constants.THETA_0_RESOLUTION
+        if dist_to_goal < 1.0:
+            theta_resolution = base_resolution * 0.5  # Finer resolution near goal
+        elif dist_to_goal < 5.0:
+            theta_resolution = base_resolution * 2.0
+        else:
+            theta_resolution = base_resolution * 3.0
+            
+        # Generate more diverse angle steps
+        # angle_steps = [
+        #     -3.0 * theta_resolution,
+        #     -1.5 * theta_resolution, -0.25 * theta_resolution, 0.25 * theta_resolution, 1.5 * theta_resolution,
+        #      3.0 * theta_resolution
+        # ]
+        angle_steps = [
+            -1.5 * theta_resolution, -0.25 * theta_resolution, 0.25 * theta_resolution, 1.5 * theta_resolution,
+        ]
+        # Add directional bias towards goal with improved Jacobian handling
+        goal_direction = np.array([goal_pos[0] - current_pos[0], goal_pos[1] - current_pos[1]])
+        if np.linalg.norm(goal_direction) > 0:
+            goal_direction = goal_direction / np.linalg.norm(goal_direction)
+            
+            jacobian = self._compute_jacobian(current_state.theta_0, current_state.theta_1)
+            if jacobian is not None:
+                try:
+                    # Use damped least squares for more stable inverse
+                    lambda_factor = 0.1
+                    J_T = jacobian.T
+                    inv_term = np.linalg.inv(jacobian @ J_T + lambda_factor * np.eye(2))
+                    joint_direction = J_T @ inv_term @ goal_direction
+                    
+                    # Add more varied biased steps
+                    bias_scales = [0.5,  1.5, 2.5, 3.5]
+                    biased_steps0 = [joint_direction[0] * scale * theta_resolution 
+                                   for scale in bias_scales]
+                    biased_steps1 = [joint_direction[1] * scale * theta_resolution 
+                                   for scale in bias_scales]
+                    angle_steps.extend(biased_steps0)
+                    angle_steps.extend(biased_steps1)
+                except np.linalg.LinAlgError:
+                    pass
+        
+        # Generate neighbors with improved sampling
+        for d_theta0 in angle_steps:
+            for d_theta1 in angle_steps:
+                theta_0_new = current_state.theta_0 + d_theta0
+                theta_1_new = current_state.theta_1 + d_theta1
+
+                # Skip if too similar to current state
+                if abs(d_theta0) < 1e-6 and abs(d_theta1) < 1e-6:
+                    continue
+
+                # Check joint limits
+                if not self.within_joint_limits((theta_0_new, theta_1_new)):
+                    continue
+
+                # Create neighbor state
+                neighbor = State(theta_0_new, theta_1_new, 0.0, 0.0)
+
+                # Check collision and workspace constraints
+                if not self.is_collision(neighbor):
+                    neighbor_pos = self.robot.forward_kinematics(theta_0_new, theta_1_new)
+                    if (self._is_in_workspace(neighbor_pos) and 
+                        self._check_step_feasibility(current_pos, neighbor_pos)):
+                        neighbors.append(neighbor)
+
+        # Debug output
+        if len(neighbors) == 0:
+            self.debug_helper.log_state(f"Warning: No valid neighbors found at distance {dist_to_goal:.3f}")
+
+        return neighbors
+
+    def _compute_jacobian(self, theta_0: float, theta_1: float) -> Optional[np.ndarray]:
+        """Compute the Jacobian matrix for the robot arm"""
+        l1, l2 = self.robot.constants.LINK_1, self.robot.constants.LINK_2
+        
+        # Compute trigonometric terms
+        c1 = np.cos(theta_0)
+        s1 = np.sin(theta_0)
+        c12 = np.cos(theta_0 + theta_1)
+        s12 = np.sin(theta_0 + theta_1)
+        
+        # Compute Jacobian elements
+        J = np.array([
+            [-l1*s1 - l2*s12, -l2*s12],
+            [l1*c1 + l2*c12, l2*c12]
+        ])
+        
+        return J
+
+    def _check_step_feasibility(self, current_pos: Tuple[float, float], 
+                              next_pos: Tuple[float, float], 
+                              max_step: float = 0.5) -> bool:
+        """Check if the step between positions is feasible"""
+        step_size = np.hypot(next_pos[0] - current_pos[0], 
+                           next_pos[1] - current_pos[1])
+        return step_size <= max_step
+    def _is_in_workspace(self, pos: Tuple[float, float]) -> bool:
+        """Check if a position is within the robot's workspace"""
+        dist_from_base = np.hypot(pos[0], pos[1])
+        min_reach = self.robot.constants.min_reachable_radius()
+        max_reach = self.robot.constants.max_reachable_radius()
+        return min_reach <= dist_from_base <= max_reach
+
+    def heuristic_coarse(self, current: State, goal: State) -> float:
+        """Simplified heuristic for coarse planning"""
+        current_pos = self.robot.forward_kinematics(current.theta_0, current.theta_1)
+        goal_pos = self.robot.forward_kinematics(goal.theta_0, goal.theta_1)
+        return np.hypot(current_pos[0] - goal_pos[0], current_pos[1] - goal_pos[1])
+
+    def distance_coarse(self, from_state: State, to_state: State) -> float:
+        """Simple Euclidean distance in joint space for coarse planning"""
+        return np.hypot(to_state.theta_0 - from_state.theta_0,
+                       to_state.theta_1 - from_state.theta_1)
+
+    def is_goal_coarse(self, current_state: State, goal_state: State) -> bool:
+        """Improved goal check for coarse planning with adaptive thresholds"""
+        current_pos = self.robot.forward_kinematics(current_state.theta_0, current_state.theta_1)
+        goal_pos = self.robot.forward_kinematics(goal_state.theta_0, goal_state.theta_1)
+        distance_to_goal = np.hypot(current_pos[0] - goal_pos[0], current_pos[1] - goal_pos[1])
+        
+        # Adaptive position threshold based on robot dimensions
+        l1, l2 = self.robot.constants.LINK_1, self.robot.constants.LINK_2
+        workspace_size = l1 + l2
+        position_threshold = min(0.2, workspace_size * 0.05)  # 5% of workspace size or 0.2, whichever is smaller
+        
+        # Adaptive angle threshold based on distance
+        base_angle_threshold = 0.15  # radians (~8.6 degrees)
+        angle_threshold = base_angle_threshold * (1.0 + distance_to_goal / workspace_size)
+        
+        angle_diff_0 = abs(current_state.theta_0 - goal_state.theta_0)
+        angle_diff_1 = abs(current_state.theta_1 - goal_state.theta_1)
+        
+        # Debug output
+        # self.debug_helper.log_state(f"Goal check - distance: {distance_to_goal:.3f}, threshold: {position_threshold:.3f}")
+        # self.debug_helper.log_state(f"Angle diffs - theta0: {angle_diff_0:.3f}, theta1: {angle_diff_1:.3f}, threshold: {angle_threshold:.3f}")
+        
+        return (distance_to_goal <= position_threshold) #and 
+               # angle_diff_0 <= angle_threshold and 
+               # angle_diff_1 <= angle_threshold)
+
+    def validate_sanitized_path(self, original_path: List[State], sanitized_path: List[State]) -> bool:
+        """
+        Validate that the sanitized path maintains the essential properties of the original path.
+        
+        Args:
+            original_path (List[State]): Original path before sanitization
+            sanitized_path (List[State]): Path after sanitization
+            
+        Returns:
+            bool: True if sanitized path is valid, False otherwise
+        """
+        if not original_path or not sanitized_path:
+            return False
+            
+        # Check start and goal states match
+        if (sanitized_path[0] != original_path[0] or 
+            sanitized_path[-1] != original_path[-1]):
+            return False
+        
+        # Check maximum deviation between paths
+        max_deviation = 0.0
+        for orig_state in original_path:
+            # Find closest point in sanitized path
+            min_dist = float('inf')
+            for san_state in sanitized_path:
+                dist = np.hypot(
+                    orig_state.theta_0 - san_state.theta_0,
+                    orig_state.theta_1 - san_state.theta_1
+                )
+                min_dist = min(min_dist, dist)
+            max_deviation = max(max_deviation, min_dist)
+        
+        # Maximum allowed deviation (in radians)
+        max_allowed_deviation = 0.2
+        if max_deviation > max_allowed_deviation:
+            return False
+        
+        # Check for velocity discontinuities
+        for i in range(1, len(sanitized_path)):
+            delta_v = np.hypot(
+                sanitized_path[i].omega_0 - sanitized_path[i-1].omega_0,
+                sanitized_path[i].omega_1 - sanitized_path[i-1].omega_1
+            )
+            if delta_v > self.constants.MAX_VELOCITY:
+                return False
+        
+        return True
     def check_timeout_and_progress(self, current: State, goal: State, start_time: float):
         """Check for timeout and lack of progress"""
         current_time = time.time()
@@ -928,7 +1169,7 @@ class AStarPlanner(GridBasedPlanner):
 
 
     def _check_kinematic_feasibility(self, current: State, next: State) -> bool:
-        """Verify kinematic feasibility with relaxed constraints"""
+        """Verify kinematic feasibility with relaxed constraints and debugging"""
         dt = self.constants.DT
         max_accel = self.constants.MAX_ACCELERATION
         
@@ -936,12 +1177,28 @@ class AStarPlanner(GridBasedPlanner):
         alpha_0 = (next.omega_0 - current.omega_0) / dt
         alpha_1 = (next.omega_1 - current.omega_1) / dt
         
+        # self.debug_helper.log_state(f"\nKinematic Feasibility Check:")
+        # self.debug_helper.log_state(f"Current velocities: ω0={current.omega_0:.3f}, ω1={current.omega_1:.3f}")
+        # self.debug_helper.log_state(f"Next velocities: ω0={next.omega_0:.3f}, ω1={next.omega_1:.3f}")
+        # self.debug_helper.log_state(f"Required accelerations: α0={alpha_0:.3f}, α1={alpha_1:.3f}")
+        # self.debug_helper.log_state(f"Max allowed acceleration: {max_accel}")
+        
         # Allow slightly higher accelerations for better maneuverability
-        accel_tolerance = 1.1  # 10% tolerance
-        if (abs(alpha_0) > max_accel * accel_tolerance or 
-            abs(alpha_1) > max_accel * accel_tolerance):
+        accel_tolerance = 1.5  # Increase from 1.1 to 1.5
+        max_allowed = max_accel * accel_tolerance
+        
+        if abs(alpha_0) > max_allowed or abs(alpha_1) > max_allowed:
+            # self.debug_helper.log_state(f"Failed: Required accelerations exceed limits")
+            return False
+            
+        # Add velocity change limit
+        max_vel_change = self.constants.MAX_VELOCITY * 0.5  # Limit velocity changes to 50% of max
+        if abs(next.omega_0 - current.omega_0) > max_vel_change or \
+           abs(next.omega_1 - current.omega_1) > max_vel_change:
+            # self.debug_helper.log_state(f"Failed: Velocity change too large")
             return False
         
+        # self.debug_helper.log_state("Passed kinematic feasibility")
         return True
 
     def _generate_random_primitives(self) -> List[Tuple[float, float]]:
@@ -1020,255 +1277,130 @@ class AStarPlanner(GridBasedPlanner):
         return neighbors
 
     def planbid(self, start: Tuple[float, float], goal: Tuple[float, float], robot, 
-             final_velocities: Tuple[float, float] = (0.0, 0.0)) -> List[State]:
-        # Reset planning state
-        self.explored_states_count = 0
-        self.best_distance_to_goal = float('inf')
-        start_time = time.time()
-        
-        # Initialize forward search
-        forward_start_state = State(robot.theta_0, robot.theta_1, robot.omega_0, robot.omega_1)
-        goal_theta = robot.inverse_kinematics(*goal)
-        forward_goal_state = State(goal_theta[0], goal_theta[1], final_velocities[0], final_velocities[1])
+                 final_velocities: Tuple[float, float] = (0.0, 0.0)) -> List[State]:
+            """Plan a path from start to goal using bidirectional A* search."""
+            # Reset planning state
+            self.explored_states_count = 0
+            self.best_distance_to_goal = float('inf')
+            start_time = time.time()
 
-        # Initialize backward search
-        backward_start_state = forward_goal_state
-        backward_goal_state = forward_start_state
-
-        # Initialize forward direction
-        forward_open = [(self.heuristic(forward_start_state, forward_goal_state), 0, forward_start_state)]
-        forward_closed: Set[State] = set()
-        forward_came_from: Dict[State, Optional[State]] = {forward_start_state: None}
-        forward_g_score: Dict[State, float] = {forward_start_state: 0}
-
-        # Initialize backward direction
-        backward_open = [(self.heuristic(backward_start_state, backward_goal_state), 0, backward_start_state)]
-        backward_closed: Set[State] = set()
-        backward_came_from: Dict[State, Optional[State]] = {backward_start_state: None}
-        backward_g_score: Dict[State, float] = {backward_start_state: 0}
-
-        # Track best solutions found
-        best_path = None
-        best_distance = float('inf')
-        meeting_point = None
-
-        while forward_open and backward_open:
-            # Process forward search
-            if forward_open:
-                current_forward = forward_open[0][2]
-                current_forward_pos = robot.forward_kinematics(current_forward.theta_0, current_forward.theta_1)
-                forward_distance = np.hypot(current_forward_pos[0] - goal[0], 
-                                          current_forward_pos[1] - goal[1])
-
-                # Check if forward and backward searches meet
-                for state in backward_closed:
-                    if self.states_close_enough(current_forward, state):
-                        meeting_point = (current_forward, state)
-                        break
-
-                # Update best path if this one is closer
-                if forward_distance < best_distance:
-                    best_distance = forward_distance
-                    best_path = self.reconstruct_bidirectional_path(
-                        current_forward, forward_came_from, backward_came_from, meeting_point)
-                    self.last_progress_time = time.time()
-
-                _, _, current = heapq.heappop(forward_open)
-                forward_closed.add(current)
-
-                # Expand forward neighbors
-                for neighbor in self.get_neighbors(current):
-                    if neighbor in forward_closed:
-                        continue
-
-                    tentative_g_score = forward_g_score[current] + self.distance(current, neighbor)
-
-                    if neighbor not in forward_g_score or tentative_g_score < forward_g_score[neighbor]:
-                        if not self.is_collision(neighbor):
-                            forward_came_from[neighbor] = current
-                            forward_g_score[neighbor] = tentative_g_score
-                            f_score = tentative_g_score + self.heuristic(neighbor, forward_goal_state)
-                            heapq.heappush(forward_open, (f_score, self.explored_states_count, neighbor))
-
-            # Process backward search
-            if backward_open:
-                current_backward = backward_open[0][2]
-                
-                # Check if forward and backward searches meet
-                for state in forward_closed:
-                    if self.states_close_enough(current_backward, state):
-                        meeting_point = (state, current_backward)
-                        break
-
-                _, _, current = heapq.heappop(backward_open)
-                backward_closed.add(current)
-
-                # Expand backward neighbors
-                for neighbor in self.get_neighbors(current):
-                    if neighbor in backward_closed:
-                        continue
-
-                    tentative_g_score = backward_g_score[current] + self.distance(current, neighbor)
-
-                    if neighbor not in backward_g_score or tentative_g_score < backward_g_score[neighbor]:
-                        if not self.is_collision(neighbor):
-                            backward_came_from[neighbor] = current
-                            backward_g_score[neighbor] = tentative_g_score
-                            f_score = tentative_g_score + self.heuristic(neighbor, backward_goal_state)
-                            heapq.heappush(backward_open, (f_score, self.explored_states_count, neighbor))
-
-            # Check timeout and progress
-            if time.time() - start_time > self.planning_timeout:
-                print("Planning timeout - returning best path")
-                return best_path if best_path else self.reconstruct_bidirectional_path(
-                    current_forward, forward_came_from, backward_came_from, meeting_point)
-
-            if time.time() - self.last_progress_time > 5.0 and best_path:
-                print("No progress - returning best path")
-                return best_path
-
-            # Meeting point found
-            if meeting_point:
-                return self.reconstruct_bidirectional_path(
-                    meeting_point[0], forward_came_from, backward_came_from, meeting_point)
-
-            # Memory management
-            if self.explored_states_count % 1000 == 0:
-                self.clear_cache()
-
-            self.explored_states_count += 1
-            if self.explored_states_count > self.max_explored_states:
-                return best_path if best_path else self.reconstruct_bidirectional_path(
-                    current_forward, forward_came_from, backward_came_from, meeting_point)
-
-        raise ValueError("No path found")
-
-    def Plan(self, start: Tuple[float, float], goal: Tuple[float, float], robot, 
-                final_velocities: Tuple[float, float] = (0.0, 0.0)) -> List[State]:
-        """Plan a path from start to goal with trajectory optimization."""
-        # Get initial path
-        try:
-            path = self.plan(start, goal, robot, final_velocities)
-            
-            # If no path is found, return None or raise exception
-            if not path:
-                self.debug_helper.log_state("No path found in initial planning")
-                raise ValueError("No valid path found")
-                return None
-                
-            # Validate and fix path discontinuities
-            smoothed_path = []
-            for i in range(len(path)):
-                if i == 0:
-                    smoothed_path.append(path[i])
-                    continue
-                    
-                prev_state = smoothed_path[-1]
-                curr_state = path[i]
-                
-                # Check for large jumps
-                delta_theta0 = abs(curr_state.theta_0 - prev_state.theta_0)
-                delta_theta1 = abs(curr_state.theta_1 - prev_state.theta_1)
-                
-                if delta_theta0 > 0.1 or delta_theta1 > 0.1:
-                    # Insert intermediate states
-                    steps = max(int(max(delta_theta0, delta_theta1) / 0.05), 1)
-                    for j in range(1, steps):
-                        alpha = j / steps
-                        interp_state = State(
-                            prev_state.theta_0 + alpha * (curr_state.theta_0 - prev_state.theta_0),
-                            prev_state.theta_1 + alpha * (curr_state.theta_1 - prev_state.theta_1),
-                            prev_state.omega_0 + alpha * (curr_state.omega_0 - prev_state.omega_0),
-                            prev_state.omega_1 + alpha * (curr_state.omega_1 - prev_state.omega_1)
-                        )
-                        smoothed_path.append(interp_state)
-                
-                smoothed_path.append(curr_state)
-
-            self.debug_helper.print_path_stats(smoothed_path, robot)
-            self.debug_helper.validate_path_limits(smoothed_path, robot)
-            self.debug_helper.print_path_points(smoothed_path)
-
-            return smoothed_path
-
-        except Exception as e:
-            self.debug_helper.log_state(f"Planning error: {str(e)}")
-            return None
-
-    def plan(self, start: Tuple[float, float], goal: Tuple[float, float], robot, 
-             final_velocities: Tuple[float, float] = (0.0, 0.0)) -> List[State]:
-        """Internal planning method."""
-        
-        if not hasattr(self, 'debug_helper'):
-            self.debug_helper = DebugHelper(debug=True)
-            
-        self.debug_helper.print_planning_header()
-        self.debug_helper.log_state(f"Planning path from {start} to {goal}")
-        
-        # Reset planning state
-        self.explored_states_count = 0
-        self.best_distance_to_goal = float('inf')
-        best_path = None
-        
-        try:
-            # Get goal configuration
+            # Initialize forward search
+            forward_start_state = State(robot.theta_0, robot.theta_1, robot.omega_0, robot.omega_1)
             goal_theta = robot.inverse_kinematics(*goal)
-            start_theta = robot.inverse_kinematics(*start)
-            
-            start_state = State(start_theta[0], start_theta[1], 0.0, 0.0)
-            goal_state = State(goal_theta[0], goal_theta[1], final_velocities[0], final_velocities[1])
-            self.goal_state = goal_state
-            
-            # Initialize planning
-            open_set = [(self.heuristic(start_state, goal_state), 0, start_state)]
-            closed_set = set()
-            came_from = {start_state: None}
-            g_score = {start_state: 0}
-            
-            while open_set:
-                current_state = open_set[0][2]
-                current_pos = robot.forward_kinematics(current_state.theta_0, current_state.theta_1)
-                current_distance = np.hypot(current_pos[0] - goal[0], current_pos[1] - goal[1])
-                
-                if current_distance < self.best_distance_to_goal:
-                    self.best_distance_to_goal = current_distance
-                    best_path = self.reconstruct_path(came_from, current_state)
-                    self.debug_helper.log_state(f"New best distance: {current_distance:.3f}")
+            forward_goal_state = State(goal_theta[0], goal_theta[1], final_velocities[0], final_velocities[1])
+            self.goal_state = forward_goal_state
+
+            # Initialize backward search
+            backward_start_state = forward_goal_state
+            backward_goal_state = forward_start_state
+
+            # Initialize forward direction
+            forward_open = [(self.heuristic(forward_start_state, forward_goal_state), 0, forward_start_state)]
+            forward_closed: Set[State] = set()
+            forward_came_from: Dict[State, Optional[State]] = {forward_start_state: None}
+            forward_g_score: Dict[State, float] = {forward_start_state: 0}
+
+            # Initialize backward direction
+            backward_open = [(self.heuristic(backward_start_state, backward_goal_state), 0, backward_start_state)]
+            backward_closed: Set[State] = set()
+            backward_came_from: Dict[State, Optional[State]] = {backward_start_state: None}
+            backward_g_score: Dict[State, float] = {backward_start_state: 0}
+
+            # Track best solutions found
+            best_path = None
+            best_distance = float('inf')
+            meeting_point = None
+
+            while forward_open and backward_open:
+                # Process forward search
+                if forward_open:
+                    current_forward = forward_open[0][2]
+                    current_forward_pos = robot.forward_kinematics(current_forward.theta_0, current_forward.theta_1)
+                    forward_distance = np.hypot(current_forward_pos[0] - goal[0], 
+                                              current_forward_pos[1] - goal[1])
+
+                    # Check if forward and backward searches meet
+                    for state in backward_closed:
+                        if self.states_close_enough(current_forward, state):
+                            meeting_point = (current_forward, state)
+                            break
+
+                    # Update best path if this one is closer
+                    if forward_distance < best_distance:
+                        best_distance = forward_distance
+                        best_path = self.reconstruct_bidirectional_path(
+                            current_forward, forward_came_from, backward_came_from, meeting_point)
+                        self.last_progress_time = time.time()
+
+                    _, _, current = heapq.heappop(forward_open)
+                    forward_closed.add(current)
+
+                    # Expand forward neighbors
+                    for neighbor in self.get_neighbors(current):
+                        if neighbor in forward_closed:
+                            continue
+
+                        tentative_g_score = forward_g_score[current] + self.distance(current, neighbor)
+
+                        if neighbor not in forward_g_score or tentative_g_score < forward_g_score[neighbor]:
+                            if not self.is_collision(neighbor):
+                                forward_came_from[neighbor] = current
+                                forward_g_score[neighbor] = tentative_g_score
+                                f_score = tentative_g_score + self.heuristic(neighbor, forward_goal_state)
+                                heapq.heappush(forward_open, (f_score, self.explored_states_count, neighbor))
+
+                # Process backward search
+                if backward_open:
+                    current_backward = backward_open[0][2]
                     
-                # Check if we're at goal
-                if self.is_goal(current_state, goal_state):
-                    path = self.reconstruct_path(came_from, current_state)
-                    if self.debug_helper.validate_planner_output(path, start, goal, robot):
-                        return path
-                
-                _, _, current = heapq.heappop(open_set)
-                closed_set.add(current)
-                
-                # Expand neighbors
-                for neighbor in self.get_neighbors(current):
-                    if neighbor in closed_set:
-                        continue
-                        
-                    tentative_g_score = g_score[current] + self.distance(current, neighbor)
-                    
-                    if neighbor not in g_score or tentative_g_score < g_score[neighbor]:
-                        if not self.is_collision(neighbor):
-                            came_from[neighbor] = current
-                            g_score[neighbor] = tentative_g_score
-                            f_score = tentative_g_score + self.heuristic(neighbor, goal_state)
-                            heapq.heappush(open_set, (f_score, self.explored_states_count, neighbor))
-                
+                    # Check if forward and backward searches meet
+                    for state in forward_closed:
+                        if self.states_close_enough(current_backward, state):
+                            meeting_point = (state, current_backward)
+                            break
+
+                    _, _, current = heapq.heappop(backward_open)
+                    backward_closed.add(current)
+
+                    # Expand backward neighbors
+                    for neighbor in self.get_neighbors(current):
+                        if neighbor in backward_closed:
+                            continue
+
+                        tentative_g_score = backward_g_score[current] + self.distance(current, neighbor)
+
+                        if neighbor not in backward_g_score or tentative_g_score < backward_g_score[neighbor]:
+                            if not self.is_collision(neighbor):
+                                backward_came_from[neighbor] = current
+                                backward_g_score[neighbor] = tentative_g_score
+                                f_score = tentative_g_score + self.heuristic(neighbor, backward_goal_state)
+                                heapq.heappush(backward_open, (f_score, self.explored_states_count, neighbor))
+
+                # Check timeout and progress
+                if time.time() - start_time > self.planning_timeout:
+                    self.debug_helper.log_state("Planning timeout - returning best path")
+                    return best_path if best_path else self.reconstruct_bidirectional_path(
+                        current_forward, forward_came_from, backward_came_from, meeting_point)
+
+                if time.time() - self.last_progress_time > 5.0 and best_path:
+                    self.debug_helper.log_state("No progress - returning best path")
+                    return best_path
+
+                # Meeting point found
+                if meeting_point:
+                    return self.reconstruct_bidirectional_path(
+                        meeting_point[0], forward_came_from, backward_came_from, meeting_point)
+
+                # Memory management
+                if self.explored_states_count % 1000 == 0:
+                    self.clear_cache()
+
                 self.explored_states_count += 1
                 if self.explored_states_count > self.max_explored_states:
-                    self.debug_helper.log_state("Max explored states reached")
-                    return best_path if best_path else []
-                    
-            # If we get here, no path was found
-            return best_path if best_path else []
-            
-        except Exception as e:
-            self.debug_helper.log_state(f"Planning error: {str(e)}")
-            return []
+                    return best_path if best_path else self.reconstruct_bidirectional_path(
+                        current_forward, forward_came_from, backward_came_from, meeting_point)
+
+            raise ValueError("No path found")
 
     def states_close_enough(self, state1: State, state2: State, threshold: float = 0.1) -> bool:
         """Check if two states are kinodynamically connectable"""
@@ -1287,7 +1419,7 @@ class AStarPlanner(GridBasedPlanner):
         required_accel_1 = abs(state2.omega_1 - state1.omega_1) / dt
         
         accel_feasible = (required_accel_0 <= self.constants.MAX_ACCELERATION and 
-                         required_accel_1 <= self.constants.MAX_ACCELERATION)
+                          required_accel_1 <= self.constants.MAX_ACCELERATION)
         
         return pos_diff < threshold and vel_diff < self.constants.VELOCITY_RESOLUTION and accel_feasible
 
@@ -1350,6 +1482,545 @@ class AStarPlanner(GridBasedPlanner):
         else:
             # Just reverse and combine paths if no meeting point
             return forward_path[::-1] + backward_path
+
+    def Plan(self, start: Tuple[float, float], goal: Tuple[float, float], robot, 
+                    final_velocities: Tuple[float, float] = (0.0, 0.0)) -> List[State]:
+        """Plan a path from start to goal with trajectory optimization."""
+        # Get initial path
+        try:
+            # First try coarse planning
+            self.set_mode('kinodynamic')
+            path = self.plan(start, goal, robot, final_velocities)
+            self.debug_helper.print_path_stats(path, robot)
+            self.debug_helper.validate_path_limits(path, robot)
+            self.debug_helper.print_path_points(path)
+            return path
+            coarse_path = self.plan(start, goal, robot)
+            if not coarse_path:
+                self.debug_helper.log_state("Coarse planning failed, attempting kinodynamic planning")
+                self.set_mode('kinodynamic')
+                path = plan(start, goal, robot, final_velocities)
+                self.debug_helper.print_path_stats(path, robot)
+                self.debug_helper.validate_path_limits(path, robot)
+                self.debug_helper.print_path_points(path)
+                return path
+                
+            # If coarse path found, refine it with kinodynamic constraints
+            self.set_mode('kinodynamic')
+            refined_path = self._refine_path(coarse_path, robot)
+            coarse_path_last_state = coarse_path[-1] 
+            goal_pos = robot.forward_kinematics(goal[0], goal[1])
+            coarse_path_last_pos = robot.forward_kinematics(coarse_path_last_state.theta_0, coarse_path_last_state.theta_1)
+            dist_to_goal = np.hypot(goal_pos[0] - coarse_path_last_pos[0], goal_pos[1] - coarse_path_last_pos[1])
+
+            self.debug_helper.log_state(f"dist_to_goal: {dist_to_goal:.3f}")
+            
+            if self.best_distance_to_goal < 2.0:
+                self.debug_helper.log_state("Successfully refined coarse path")
+                self.debug_helper.print_path_stats(refined_path, robot)
+                self.debug_helper.validate_path_limits(refined_path, robot)
+                self.debug_helper.print_path_points(refined_path)
+                return refined_path
+            else:
+                self.debug_helper.log_state("Coarse path refining fails, attempting kinodynamic planning")
+                path_segments = 5
+                for i in range(path_segments,0 , -1):
+                    self.debug_helper.log_state("Attempting to connect coarse path to goal")
+                    # Get state from coarse path
+                    if refined_path:
+                        intermediate_state = refined_path[(int(len(coarse_path) * (i) / path_segments)) - 1]
+                    else:
+                        intermediate_state = coarse_path[(int(len(coarse_path) * (i) / path_segments)) - 1]
+                    # Extract state information properly
+                    new_goal = (intermediate_state.theta_0, intermediate_state.theta_1)
+                    # Use velocities from the state if available
+                    velocities = (getattr(intermediate_state, 'velocity_0', 0.0),
+                                getattr(intermediate_state, 'velocity_1', 0.0))
+                    
+                    path = self.plan(goal, new_goal, robot, velocities)
+                    
+                    if path:
+                        path.reverse()
+                        path_final = []
+                        if refined_path:
+                            # Use proper indexing for refined path
+                            split_index = (int(len(refined_path) * i / path_segments)) - 1
+                            path_final = refined_path[:split_index]
+                            path_final.extend(path)
+                        else:
+                            # Use proper indexing for coarse path
+                            split_index = (int(len(coarse_path) * i / path_segments)) - 1
+                            path_final = coarse_path[:split_index]
+                            path_final.extend(path)
+                        
+                        self.debug_helper.print_path_stats(path_final, robot)
+                        self.debug_helper.print_path_points(path_final)
+                        return path_final
+                        
+        except Exception as e:
+            self.debug_helper.log_state(f"Planning error: {str(e)}")
+            return []
+
+    def _refine_path(self, coarse_path: List[State], robot: Robot) -> List[State]:
+        """Refine coarse path with kinodynamic constraints and smoothness"""
+        if not coarse_path:
+            return None
+
+        try:
+            # Initial refinement with velocity constraints
+            refined_path = self._initial_velocity_refinement(coarse_path)
+            if not refined_path:
+                return None
+
+            # Apply acceleration and jerk constraints
+            smoothed_path = self._apply_smoothness_constraints(refined_path)
+            if not smoothed_path:
+                return None
+
+            # Final velocity profile optimization
+            optimized_path = self._optimize_velocity_profile(smoothed_path)
+            
+            return optimized_path
+
+        except Exception as e:
+            self.debug_helper.log_state(f"Path refinement error: {str(e)}")
+            return None
+
+    def _initial_velocity_refinement(self, coarse_path: List[State]) -> List[State]:
+        """Initial refinement with independent joint constraints"""
+        refined_path = []
+        dt = self.constants.DT
+
+        # Add start state
+        refined_path.append(coarse_path[0])
+
+        for i in range(1, len(coarse_path)):
+            prev_state = refined_path[-1]
+            target_state = coarse_path[i]
+
+            # Compute required velocities for each joint independently
+            delta_theta_0 = target_state.theta_0 - prev_state.theta_0
+            delta_theta_1 = target_state.theta_1 - prev_state.theta_1
+
+            # Compute independent time scales for each joint based on velocity limits
+            time_scale_0 = max(1.0, abs(delta_theta_0) / (self.constants.MAX_VELOCITY * dt))
+            time_scale_1 = max(1.0, abs(delta_theta_1) / (self.constants.MAX_VELOCITY * dt))
+            
+            # Use the longer time scale to ensure both joints respect limits
+            time_scale = max(time_scale_0, time_scale_1)
+            
+            # Compute velocities independently
+            omega_0 = delta_theta_0 / (dt * time_scale)
+            omega_1 = delta_theta_1 / (dt * time_scale)
+
+            # Enforce velocity limits independently for each joint
+            omega_0 = np.clip(omega_0, -self.constants.MAX_VELOCITY, self.constants.MAX_VELOCITY)
+            omega_1 = np.clip(omega_1, -self.constants.MAX_VELOCITY, self.constants.MAX_VELOCITY)
+
+            # Create intermediate states with independent joint consideration
+            num_steps = max(1, int(time_scale))
+            for step in range(num_steps):
+                alpha = (step + 1) / num_steps
+                
+                # Independent position interpolation
+                theta_0 = prev_state.theta_0 + alpha * delta_theta_0
+                theta_1 = prev_state.theta_1 + alpha * delta_theta_1
+                
+                # Independent velocity profiles using bell curve for each joint
+                bell_shape = 1.0 - 0.5 * abs(alpha - 0.5)  # Bell curve factor
+                current_omega_0 = omega_0 * bell_shape if abs(delta_theta_0) > 1e-6 else 0.0
+                current_omega_1 = omega_1 * bell_shape if abs(delta_theta_1) > 1e-6 else 0.0
+
+                # Create state and check independent joint constraints
+                refined_state = State(theta_0, theta_1, current_omega_0, current_omega_1)
+                
+                # Verify kinematic feasibility considering joints independently
+                if self._check_kinematic_feasibility(prev_state, refined_state):
+                    refined_path.append(refined_state)
+                else:
+                    # Try scaling down velocities independently
+                    scale_factor = 0.8  # Reduce velocities by 20%
+                    adjusted_state = State(
+                        theta_0, 
+                        theta_1,
+                        current_omega_0 * scale_factor if abs(current_omega_0) > self.constants.MAX_VELOCITY else current_omega_0,
+                        current_omega_1 * scale_factor if abs(current_omega_1) > self.constants.MAX_VELOCITY else current_omega_1
+                    )
+                    
+                    if self._check_kinematic_feasibility(prev_state, adjusted_state):
+                        refined_path.append(adjusted_state)
+                    else:
+                        return None
+
+        return refined_path
+
+    def _apply_smoothness_constraints(self, path: List[State]) -> List[State]:
+        """Apply acceleration and jerk constraints with independent joint handling"""
+        if len(path) < 3:
+            return path
+
+        smoothed_path = []
+        dt = self.constants.DT
+        window = self.smoothing_window
+
+        # Add initial states
+        smoothed_path.extend(path[:2])
+
+        for i in range(2, len(path) - 1):
+            # Get window of states
+            start_idx = max(0, i - window)
+            end_idx = min(len(path), i + window + 1)
+            window_states = path[start_idx:end_idx]
+
+            # Current state and its neighbors
+            prev_state = smoothed_path[-1]
+            current_state = path[i]
+            next_state = path[i + 1]
+
+            # Compute accelerations for each joint independently
+            current_acc_0 = (current_state.omega_0 - prev_state.omega_0) / dt
+            current_acc_1 = (current_state.omega_1 - prev_state.omega_1) / dt
+            next_acc_0 = (next_state.omega_0 - current_state.omega_0) / dt
+            next_acc_1 = (next_state.omega_1 - current_state.omega_1) / dt
+
+            # Compute jerks for each joint independently
+            jerk_0 = (next_acc_0 - current_acc_0) / dt
+            jerk_1 = (next_acc_1 - current_acc_1) / dt
+
+            # Apply independent jerk limits and compute resulting states
+            next_state = self._apply_independent_jerk_limits(
+                current_state, next_state, 
+                current_acc_0, current_acc_1,
+                jerk_0, jerk_1, dt
+            )
+
+            # Smooth velocities independently using window average
+            if len(window_states) >= 3:
+                smoothed_omega_0 = self._smooth_velocity_independent(
+                    [s.omega_0 for s in window_states],
+                    current_state.omega_0,
+                    self.constants.MAX_ACCELERATION
+                )
+                smoothed_omega_1 = self._smooth_velocity_independent(
+                    [s.omega_1 for s in window_states],
+                    current_state.omega_1,
+                    self.constants.MAX_ACCELERATION
+                )
+
+                smoothed_state = State(
+                    current_state.theta_0,
+                    current_state.theta_1,
+                    smoothed_omega_0,
+                    smoothed_omega_1
+                )
+
+                if self._check_independent_kinematic_feasibility(prev_state, smoothed_state):
+                    smoothed_path.append(smoothed_state)
+                else:
+                    # Try independent scaling of velocities
+                    scaled_state = self._scale_velocities_independently(prev_state, smoothed_state)
+                    if scaled_state:
+                        smoothed_path.append(scaled_state)
+                    else:
+                        smoothed_path.append(current_state)
+            else:
+                smoothed_path.append(current_state)
+
+        # Add final state
+        smoothed_path.append(path[-1])
+        return smoothed_path
+
+    def _apply_independent_jerk_limits(self, current_state: State, next_state: State,
+                                     current_acc_0: float, current_acc_1: float,
+                                     jerk_0: float, jerk_1: float, dt: float) -> State:
+        """Apply jerk limits independently to each joint"""
+        # Handle joint 0
+        if abs(jerk_0) > self.max_jerk:
+            scale_0 = self.max_jerk / abs(jerk_0)
+            next_acc_0 = current_acc_0 + jerk_0 * scale_0 * dt
+            omega_0 = current_state.omega_0 + next_acc_0 * dt
+        else:
+            omega_0 = next_state.omega_0
+
+        # Handle joint 1 independently
+        if abs(jerk_1) > self.max_jerk:
+            scale_1 = self.max_jerk / abs(jerk_1)
+            next_acc_1 = current_acc_1 + jerk_1 * scale_1 * dt
+            omega_1 = current_state.omega_1 + next_acc_1 * dt
+        else:
+            omega_1 = next_state.omega_1
+
+        return State(
+            next_state.theta_0,
+            next_state.theta_1,
+            omega_0,
+            omega_1
+        )
+
+    def _smooth_velocity_independent(self, velocities: List[float], current_velocity: float, 
+                                   max_accel: float, min_velocity: float = 0.01) -> float:
+        """Smooth velocity independently for each joint with improved constraints"""
+        if not velocities:
+            return current_velocity
+
+        # Compute weighted average with more weight to nearby points
+        weights = [1.0 - abs(i - len(velocities)//2)/(len(velocities)//2) for i in range(len(velocities))]
+        weighted_avg = np.average(velocities, weights=weights)
+
+        # Limit change based on acceleration constraint
+        dt = self.constants.DT
+        max_change = max_accel * dt
+        delta_v = weighted_avg - current_velocity
+
+        # Apply acceleration limits
+        if abs(delta_v) > max_change:
+            delta_v = np.sign(delta_v) * max_change
+
+        # Ensure minimum velocity if moving
+        new_velocity = current_velocity + delta_v
+        if abs(new_velocity) < min_velocity and abs(current_velocity) > min_velocity:
+            new_velocity = np.sign(current_velocity) * min_velocity
+
+        return new_velocity
+
+    def _check_independent_kinematic_feasibility(self, current: State, next: State) -> bool:
+        """Check kinematic feasibility with independent joint constraints"""
+        dt = self.constants.DT
+        max_accel = self.constants.MAX_ACCELERATION
+        max_vel = self.constants.MAX_VELOCITY
+
+        # Check velocity limits independently
+        if (abs(next.omega_0) > max_vel or abs(next.omega_1) > max_vel):
+            return False
+
+        # Compute accelerations for each joint
+        alpha_0 = (next.omega_0 - current.omega_0) / dt
+        alpha_1 = (next.omega_1 - current.omega_1) / dt
+
+        # Check acceleration limits independently
+        accel_tolerance = 1.5  # Allow slightly higher accelerations
+        max_allowed = max_accel * accel_tolerance
+
+        if abs(alpha_0) > max_allowed or abs(alpha_1) > max_allowed:
+            return False
+
+        # Check velocity changes independently
+        max_vel_change = max_vel * 0.5
+        if (abs(next.omega_0 - current.omega_0) > max_vel_change or
+            abs(next.omega_1 - current.omega_1) > max_vel_change):
+            return False
+
+        return True
+
+    def _scale_velocities_independently(self, prev_state: State, state: State) -> Optional[State]:
+        """Scale velocities independently when limits are exceeded"""
+        dt = self.constants.DT
+        max_vel = self.constants.MAX_VELOCITY
+        max_accel = self.constants.MAX_ACCELERATION
+
+        # Compute required accelerations
+        alpha_0 = (state.omega_0 - prev_state.omega_0) / dt
+        alpha_1 = (state.omega_1 - prev_state.omega_1) / dt
+
+        # Compute scaling factors independently
+        scale_0 = 1.0
+        scale_1 = 1.0
+
+        # Scale based on velocity limits
+        if abs(state.omega_0) > max_vel:
+            scale_0 = max_vel / abs(state.omega_0)
+        if abs(state.omega_1) > max_vel:
+            scale_1 = max_vel / abs(state.omega_1)
+
+        # Scale based on acceleration limits
+        if abs(alpha_0) > max_accel:
+            scale_0 = min(scale_0, max_accel / abs(alpha_0))
+        if abs(alpha_1) > max_accel:
+            scale_1 = min(scale_1, max_accel / abs(alpha_1))
+
+        # Apply independent scaling
+        scaled_state = State(
+            state.theta_0,
+            state.theta_1,
+            state.omega_0 * scale_0,
+            state.omega_1 * scale_1
+        )
+
+        if self._check_independent_kinematic_feasibility(prev_state, scaled_state):
+            return scaled_state
+        return None
+
+    def _optimize_velocity_profile(self, path: List[State]) -> List[State]:
+        """Optimize velocity profile for smoothness"""
+        if len(path) < 3:
+            return path
+
+        optimized_path = []
+        dt = self.constants.DT
+
+        # Add start state
+        optimized_path.append(path[0])
+
+        try:
+            for i in range(1, len(path) - 1):
+                prev_state = optimized_path[-1]
+                current_state = path[i]
+                next_state = path[i + 1]
+
+                # Compute optimal velocities based on position and acceleration
+                delta_pos_0 = next_state.theta_0 - prev_state.theta_0
+                delta_pos_1 = next_state.theta_1 - prev_state.theta_1
+
+                # Use trapezoidal velocity profile
+                avg_vel_0 = delta_pos_0 / (2 * dt)
+                avg_vel_1 = delta_pos_1 / (2 * dt)
+
+                # Apply velocity limits with smooth transitions
+                scale = min(1.0, self.constants.MAX_VELOCITY / (max(abs(avg_vel_0), abs(avg_vel_1)) + 1e-6))
+                
+                opt_omega_0 = avg_vel_0 * scale
+                opt_omega_1 = avg_vel_1 * scale
+
+                # Create optimized state
+                optimized_state = State(
+                    current_state.theta_0,
+                    current_state.theta_1,
+                    opt_omega_0,
+                    opt_omega_1
+                )
+
+                if self._check_kinematic_feasibility(prev_state, optimized_state):
+                    optimized_path.append(optimized_state)
+                else:
+                    optimized_path.append(current_state)
+
+            # Add final state
+            optimized_path.append(path[-1])
+            return optimized_path
+
+        except Exception as e:
+            self.debug_helper.log_state(f"Path refinement error: {str(e)}")
+            return None
+
+    def plan(self, start: Tuple[float, float], goal: Tuple[float, float], robot, 
+             final_velocities: Tuple[float, float] = (0.0, 0.0)) -> List[State]:
+        """Internal planning method."""
+        
+        if not hasattr(self, 'debug_helper'):
+            self.debug_helper = DebugHelper(debug=True)
+            
+        self.debug_helper.print_planning_header()
+        self.debug_helper.log_state(f"Planning path from {start} to {goal}")
+        
+        # Reset planning state
+        self.explored_states_count = 0
+        self.best_distance_to_goal = float('inf')
+        best_path = None
+        
+        try:
+            # Get goal configuration
+            goal_theta = robot.inverse_kinematics(*goal)
+            start_theta = robot.inverse_kinematics(*start)
+            
+            # Create start and goal states
+            if self.mode == 'kinodynamic':
+                start_state = State(start_theta[0], start_theta[1], 0.0, 0.0)
+                goal_state = State(goal_theta[0], goal_theta[1], final_velocities[0], final_velocities[1])
+            else:
+                start_state = State(start_theta[0], start_theta[1], 0.0, 0.0)
+                goal_state = State(goal_theta[0], goal_theta[1], 0.0, 0.0)
+            
+
+            # Initialize planning
+            self.goal_state = goal_state
+            open_set = [(self.heuristic_coarse(start_state, goal_state) if self.mode == 'coarse' else self.heuristic(start_state, goal_state), 0, start_state)]
+            closed_set = set()
+            came_from = {start_state: None}
+            g_score = {start_state: 0}
+            max_no_neighbor_attempts = 20
+            no_neighbor_count = 0;
+            start_time = time.time()
+            while open_set:
+                current_state = open_set[0][2]
+                try:
+                    self.check_timeout_and_progress(open_set[0][2], goal_state, start_time)
+                except PlanningTimeoutError as e:
+                    # Return best path found so far
+                    return self.reconstruct_path(came_from, open_set[0][2])
+                
+                current_pos = robot.forward_kinematics(current_state.theta_0, current_state.theta_1)
+                current_distance = np.hypot(current_pos[0] - goal[0], current_pos[1] - goal[1])
+                
+                if current_distance < self.best_distance_to_goal:
+                    self.best_distance_to_goal = current_distance
+                    best_path = self.reconstruct_path(came_from, current_state)
+                    self.debug_helper.log_state(f"New best distance: {current_distance:.3f}")
+                    self.last_progress_time = time.time()
+                    
+                # Check if we're at goal
+                if (self.is_goal_coarse(current_state, goal_state) if self.mode == 'coarse' else self.is_goal(current_state, goal_state)):
+                    path = self.reconstruct_path(came_from, current_state)
+                    if self.mode == 'coarse':
+                        self.debug_helper.log_state("Path found by coarse Planner")
+                        return path
+                    else:
+                         if self.debug_helper.validate_planner_output(path, start, goal, robot):
+                            self.debug_helper.log_state("Path found by kinodynamic Planner")
+                            return path
+                
+                _, _, current = heapq.heappop(open_set)
+                closed_set.add(current)
+                
+                # Expand neighbors
+                # Get neighbors based on mode
+                neighbors = (self.get_neighbors_coarse(current) if self.mode == 'coarse' else self.get_neighbors(current))
+                # Handle case where no valid neighbors are found
+                if not neighbors:
+                    no_neighbor_count += 1
+                    self.debug_helper.log_state(f"No valid neighbors found at distance {current_distance:.3f}")
+                    
+                    if no_neighbor_count >= max_no_neighbor_attempts:
+                        self.debug_helper.log_state(f"No valid neighbors found for {max_no_neighbor_attempts} consecutive attempts")
+                        if best_path:
+                            self.debug_helper.log_state("Returning best path found so far")
+                            return best_path
+                        else:
+                            self.debug_helper.log_state("No valid path found")
+                            return []
+                    continue
+                for neighbor in neighbors:
+                    if neighbor in closed_set:
+                        continue
+                        
+                    # Calculate cost based on mode
+                    tentative_g_score = g_score[current] + (
+                        self.distance_coarse(current, neighbor) if self.mode == 'coarse' else self.distance(current, neighbor)
+                    )
+                    
+                    if neighbor not in g_score or tentative_g_score < g_score[neighbor]:
+                        if not self.is_collision(neighbor):
+                            came_from[neighbor] = current
+                            g_score[neighbor] = tentative_g_score
+                            f_score = tentative_g_score + (
+                                self.heuristic_coarse(neighbor, goal_state) if self.mode == 'coarse'else self.heuristic(neighbor, goal_state)
+                            )
+                            heapq.heappush(open_set, (f_score, self.explored_states_count, neighbor))
+                
+                if time.time() - self.last_progress_time > self.progress_timeout and best_path:
+                    self.debug_helper.log_state("No progress - returning best path")
+                    return best_path
+                self.explored_states_count += 1
+                if self.explored_states_count > self.max_explored_states:
+                    self.debug_helper.log_state("Max explored states reached")
+                    return best_path if best_path else []
+                    
+            # If we get here, no path was found
+            self.debug_helper.log_state("No path was found")
+            return best_path if best_path else []
+            
+        except Exception as e:
+            self.debug_helper.log_state(f"Planning error: {str(e)}")
+            return []
 
 class SBPLLatticePlanner(GridBasedPlanner):
     """
@@ -1507,11 +2178,6 @@ class SBPLLatticePlanner(GridBasedPlanner):
         delta_omega = np.hypot(to_state.omega_0 - from_state.omega_0, to_state.omega_1 - from_state.omega_1)
         return delta_theta + delta_omega  # You can adjust weights if needed
 
-
-import numpy as np
-from typing import List, Tuple, Optional
-from dataclasses import dataclass
-
 class MPCController:
     """Model Predictive Controller for 2-link robotic arm"""
     def __init__(self, robot, constants):
@@ -1523,14 +2189,17 @@ class MPCController:
         self.w0 = 4.0  # Natural frequency - should be tuned
         self.path = []  # Store reference path
         self.path_index = 0  # Current path index
+
+        self.debug_helper = DebugHelper(debug=False)
         
         # Compute controller gains based on provided equations
         self.k1 = 2 / (self.h**2 + 4*self.get_rho())
         self.k2 = (2*self.h**2 + 4*self.get_rho()) / (self.h**3 + 4*self.get_rho()*self.h)
 
-        print(f"\nMPC Controller Initialized:")
-        print(f"Horizon: {self.h}, DT: {self.dt}")
-        print(f"Controller gains - k1: {self.k1:.3f}, k2: {self.k2:.3f}")
+        self.debug_helper.log_state(f"\nMPC Controller Initialized:")
+        self.debug_helper.log_state(f"Horizon: {self.h}, DT: {self.dt}")
+        self.debug_helper.log_state(f"Controller gains - k1: {self.k1:.3f}, k2: {self.k2:.3f}")
+
         
         # Initialize state histories
         self.theta_ref_history = []
@@ -1542,47 +2211,36 @@ class MPCController:
         """Compute weight factor ρ based on given equation"""
         w0h = self.w0 * self.h
         rho = (2 - w0h**2) / (4 * self.w0**2)
-        print(f"Computed rho: {rho:.3f}")
+        self.debug_helper.log_state(f"Computed rho: {rho:.3f}")
         return rho
 
-    def compute_feedback_linearization(self, theta: Tuple[float, float], 
-                                    theta_dot: Tuple[float, float],
-                                    v: Tuple[float, float]) -> Tuple[float, float]:
-        """Compute feedback linearization control law with debugging"""
-        print("\nComputing Feedback Linearization:")
-        print(f"Current state - theta: {theta}, theta_dot: {theta_dot}")
-        print(f"Synthetic control input v: {v}")
+    def compute_feedback_linearization(self, theta, theta_dot, v):
+        self.debug_helper.log_state("\nComputing Feedback Linearization:")
+        self.debug_helper.log_state(f"Current state - theta: {theta}, theta_dot: {theta_dot}")
+        self.debug_helper.log_state(f"Synthetic control input v: {v}")
         
-        # Get dynamics matrices
-        M, C, G = self.robot.compute_dynamics(theta[0], theta[1], 
-                                            theta_dot[0], theta_dot[1])
+        M, C, G = self.robot.compute_dynamics(theta[0], theta[1], theta_dot[0], theta_dot[1])
         
-        print("\nDynamics matrices:")
-        print(f"M:\n{M}")
-        print(f"C:\n{C}")
-        print(f"G:\n{G}")
+        self.debug_helper.log_state("\nDynamics matrices:")
+        self.debug_helper.log_state(f"M:\n{M}")
+        self.debug_helper.log_state(f"C:\n{C}")
+        self.debug_helper.log_state(f"G:\n{G}")
         
-        # Compute torque using feedback linearization
         tau = M @ np.array(v) + C @ np.array(theta_dot) + G
         
-        print(f"Computed torques: {tau}")
+        self.debug_helper.log_state(f"Computed torques: {tau}")
         return tau[0], tau[1]
-
-    def compute_synthetic_control(self, theta_ref: Tuple[float, float],
-                                theta: Tuple[float, float],
-                                theta_dot: Tuple[float, float]) -> Tuple[float, float]:
-        """Compute synthetic control vector v with debugging"""
-        print("\nComputing Synthetic Control:")
-        print(f"Reference theta: {theta_ref}")
-        print(f"Current theta: {theta}")
-        print(f"Current theta_dot: {theta_dot}")
+    def compute_synthetic_control(self, theta_ref, theta, theta_dot):
+        self.debug_helper.log_state("\nComputing Synthetic Control:")
+        self.debug_helper.log_state(f"Reference theta: {theta_ref}")
+        self.debug_helper.log_state(f"Current theta: {theta}")
+        self.debug_helper.log_state(f"Current theta_dot: {theta_dot}")
         
-        # Compute control for each joint
         v1 = self.k1 * (theta_ref[0] - theta[0]) - self.k2 * theta_dot[0]
         v2 = self.k1 * (theta_ref[1] - theta[1]) - self.k2 * theta_dot[1]
         
-        print(f"Position errors: ({theta_ref[0] - theta[0]:.3f}, {theta_ref[1] - theta[1]:.3f})")
-        print(f"Computed synthetic controls: v1={v1:.3f}, v2={v2:.3f}")
+        self.debug_helper.log_state(f"Position errors: ({theta_ref[0] - theta[0]:.3f}, {theta_ref[1] - theta[1]:.3f})")
+        self.debug_helper.log_state(f"Computed synthetic controls: v1={v1:.3f}, v2={v2:.3f}")
         
         return v1, v2
 
@@ -1624,42 +2282,41 @@ class MPCController:
         control_sequence = []
         
         """Optimize control sequence with debugging"""
-        print("\nOptimizing Control Sequence:")
-        print(f"Current state: {current_state}")
-        print(f"Reference trajectory length: {len(reference_trajectory)}")
+        self.debug_helper.log_state("\nOptimizing Control Sequence:")
+        self.debug_helper.log_state(f"Current state: {current_state}")
+        self.debug_helper.log_state(f"Reference trajectory length: {len(reference_trajectory)}")
         
         control_sequence = []
+        position_threshold = 0.01
         
-        for i in range(steps_in_horizon):
-            print(f"\nOptimization step {i}:")
+        for i in range(1, steps_in_horizon):
+            self.debug_helper.log_state(f"\nOptimization step {i}:")
             
-            if i < len(reference_trajectory):
-                ref = reference_trajectory[i]
-            else:
-                ref = reference_trajectory[-1]
-            
-            print(f"Reference point: {ref}")
+            ref_i = reference_trajectory[min(i, len(reference_trajectory) - 1)]
+            if i < len(reference_trajectory) and (abs(current_state[0] - ref_i[0]) > position_threshold or 
+                abs(current_state[1] - ref_i [1]) > position_threshold):
+                self.debug_helper.log_state(f"Reference point: {ref_i}")
             
             # Compute control for this step
             v = self.compute_synthetic_control(
-                ref,
+                ref_i,
                 (current_state[0], current_state[1]),
                 (current_state[2], current_state[3])
             )
             
             control_sequence.append(v)
-            print(f"Computed control: {v}")
+            self.debug_helper.log_state(f"Computed control: {v}")
         
         return control_sequence
 
     def step(self, theta_ref: Tuple[float, float], robot) -> Tuple[float, float]:
         """Execute one control step"""
-        print("\n=== MPC Step Execution ===")
+        self.debug_helper.log_state("\n=== MPC Step Execution ===")
 
         # Current state
         current_state = (robot.theta_0, robot.theta_1, robot.omega_0, robot.omega_1)
-        print(f"Current state: θ0={robot.theta_0:.3f}, θ1={robot.theta_1:.3f}, ω0={robot.omega_0:.3f}, ω1={robot.omega_1:.3f}")
-        print(f"Reference state: θ0={theta_ref[0]:.3f}, θ1={theta_ref[1]:.3f}")
+        self.debug_helper.log_state(f"Current state: θ0={robot.theta_0:.3f}, θ1={robot.theta_1:.3f}, ω0={robot.omega_0:.3f}, ω1={robot.omega_1:.3f}")
+        self.debug_helper.log_state(f"Reference state: θ0={theta_ref[0]:.3f}, θ1={theta_ref[1]:.3f}")
         
         # Generate reference trajectory over time horizon
         reference_trajectory = []
@@ -1669,26 +2326,43 @@ class MPCController:
         # h is time horizon in seconds, dt is timestep, so h/dt gives number of steps
         steps_in_horizon = int(self.h / self.dt)
 
-        print(f"\nGenerating reference trajectory:")
-        print(f"Current path index: {current_path_index}")
-        print(f"Steps in horizon: {steps_in_horizon}")
-        print(f"horizon(s): {self.h}")
-        print(f"Path length: {len(self.path)}")
+        self.debug_helper.log_state(f"\nGenerating reference trajectory:")
+        self.debug_helper.log_state(f"Current path index: {current_path_index}")
+        self.debug_helper.log_state(f"Steps in horizon: {steps_in_horizon}")
+        self.debug_helper.log_state(f"horizon(s): {self.h}")
+        self.debug_helper.log_state(f"Path length: {len(self.path)}")
         
         # Fill reference trajectory with bounds checking
-        for i in range(steps_in_horizon):
+        for i in range(1, steps_in_horizon):
             path_idx = min(current_path_index + i, len(self.path) - 1)
             
             if path_idx < len(self.path):
                 ref_state = self.path[path_idx]
                 reference_trajectory.append((ref_state.theta_0, ref_state.theta_1))
-                print(f"Reference point {i}: θ0={ref_state.theta_0:.3f}, θ1={ref_state.theta_1:.3f}")
+                self.debug_helper.log_state(f"Reference point {i}: θ0={ref_state.theta_0:.3f}, θ1={ref_state.theta_1:.3f}")
         # Optimize control sequence
         control_sequence = self.optimize_control_sequence(current_state, reference_trajectory, steps_in_horizon)
+
+
+         # Select first non-zero control action
+        # Instead of always taking first control, find first non-zero control
+        selected_control = None
+        min_control = 0.09  # Minimum control action
+        for v in control_sequence:
+            if abs(v[0]) > min_control or abs(v[1]) > min_control:
+                selected_control = v
+                break
         
+        # # If all controls are zero, use the control for the next reference point
+        # if not selected_control and len(control_sequence) > 1:
+        #     selected_control = control_sequence[1]
+        # else:
+        #     selected_control = control_sequence[0]
+
+        # FIX 2: Add minimum control threshold
         # Take first control action
-        v = control_sequence[1]
-        print(f"\nSelected control action: v={v}")
+        v = selected_control
+        self.debug_helper.log_state(f"\nSelected control action: v={v}")
         
         # Compute torques
         tau = self.compute_feedback_linearization(
@@ -1697,7 +2371,7 @@ class MPCController:
             v
         )
         
-        print(f"Final computed torques: τ0={tau[0]:.3f}, τ1={tau[1]:.3f}")
+        self.debug_helper.log_state(f"Final computed torques: τ0={tau[0]:.3f}, τ1={tau[1]:.3f}")
         
         
         # Store history
@@ -1764,15 +2438,14 @@ class MPCController:
 
 
 class Controller:
-    def __init__(self, constants: RobotConstants, world: World, planner: Planner) -> None:
-        self.constants = constants
+    def __init__(self, robot: Robot, world: World, planner: Planner) -> None:
+        self.constants = robot.constants
         self.world = world
         self.planner = planner
         self.path: List[State] = []
         self.path_index = 0
-
         # Initialize MPC controller
-        self.mpc = MPCController(None, constants)  # Robot will be set in set_goal
+        self.mpc = MPCController(None, robot.constants)  # Robot will be set in set_goal
         
         
         # Initialize trajectory tracking variables
@@ -1808,46 +2481,57 @@ class Controller:
         
         # Get path from planner
         try:
-            path = self.planner.Plan(start_pos, goal, robot, final_velocities)
+            coarse_path = self.planner.Plan(start_pos, goal, robot, final_velocities)
+            
+            # Generate trajectory from path
+            # Initialize the planner
+            trajectory_planner = TimeOptimalTrajectoryGenerator(robot, coarse_path)
+            
+            # Generate optimal trajectory
+            path = trajectory_planner.generate_trajectory(coarse_path)
+            self.debug_helper.print_trajectory_stats(path, robot)
+            self.debug_helper.validate_trajectory_dynamics(path, robot)
+            self.debug_helper.print_trajectory_points(path, robot)
+            
             if not path:
                 raise ValueError("No valid path found")
 
-            # Validate path continuity
-            for i in range(1, len(path)):
-                delta_theta0 = abs(path[i].theta_0 - path[i-1].theta_0)
-                delta_theta1 = abs(path[i].theta_1 - path[i-1].theta_1)
-                if delta_theta0 > 0.1 or delta_theta1 > 0.1:
-                    self.debug_helper.log_state(f"Warning: Large path discontinuity at index {i}")
+            # # Validate path continuity
+            # for i in range(1, len(path)):
+            #     delta_theta0 = abs(path[i].theta_0 - path[i-1].theta_0)
+            #     delta_theta1 = abs(path[i].theta_1 - path[i-1].theta_1)
+            #     if delta_theta0 > 0.1 or delta_theta1 > 0.1:
+            #         self.debug_helper.log_state(f"Warning: Large path discontinuity at index {i}")
             
-            # Extract reference trajectories with validation
-            self.reference_theta_0 = []
-            self.reference_theta_1 = []
-            self.reference_omega_0 = []
-            self.reference_omega_1 = []
-            self.reference_alpha_0: List[float] = []
-            self.reference_alpha_1: List[float] = []
+            # # Extract reference trajectories with validation
+            # self.reference_theta_0 = []
+            # self.reference_theta_1 = []
+            # self.reference_omega_0 = []
+            # self.reference_omega_1 = []
+            # self.reference_alpha_0: List[float] = []
+            # self.reference_alpha_1: List[float] = []
 
-            dt = self.constants.DT
-            for state in path:
-                if (abs(state.theta_0) <= self.constants.JOINT_LIMITS[1] and
-                    abs(state.theta_1) <= self.constants.JOINT_LIMITS[1]):
-                    self.reference_theta_0.append(state.theta_0)
-                    self.reference_theta_1.append(state.theta_1)
-                    self.reference_omega_0.append(state.omega_0)
-                    self.reference_omega_1.append(state.omega_1)
+            # dt = self.constants.DT
+            # for i in range(1, len(path)):
+            #     if (abs(path[i].theta_0) <= self.constants.JOINT_LIMITS[1] and
+            #         abs(path[i].theta_1) <= self.constants.JOINT_LIMITS[1]):
+            #         self.reference_theta_0.append(path[i].theta_0)
+            #         self.reference_theta_1.append(path[i].theta_1)
+            #         self.reference_omega_0.append(path[i].omega_0)
+            #         self.reference_omega_1.append(path[i].omega_1)
 
-                    # Compute accelerations from velocity differences
-                    if i < len(path) - 1:
-                        alpha_0 = (path[i+1].omega_0 - path[i].omega_0) / dt
-                        alpha_1 = (path[i+1].omega_1 - path[i].omega_1) / dt
-                    else:
-                        alpha_0 = 0.0  # Zero acceleration for final point
-                        alpha_1 = 0.0
+            #         # Compute accelerations from velocity differences
+            #         if i < len(path) - 1:
+            #             alpha_0 = (path[i+1].omega_0 - path[i].omega_0) / dt
+            #             alpha_1 = (path[i+1].omega_1 - path[i].omega_1) / dt
+            #         else:
+            #             alpha_0 = 0.0  # Zero acceleration for final point
+            #             alpha_1 = 0.0
                     
-                    self.reference_alpha_0.append(alpha_0)
-                    self.reference_alpha_1.append(alpha_1)
-                else:
-                    self.debug_helper.log_state(f"Skipping invalid state: {state}")
+            #         self.reference_alpha_0.append(alpha_0)
+            #         self.reference_alpha_1.append(alpha_1)
+            #     else:
+            #         self.debug_helper.log_state(f"Skipping invalid state: {path[i]}")
                     
             self.path = path
             self.mpc.set_path(path)
@@ -2118,7 +2802,7 @@ class Controller:
                 self.path_index = closest_idx
             else:
                 # If no better point found, stay at current point
-                self.path_index = min(self.path_index, len(self.path) - 1)
+                self.path_index = min(self.path_index + 1, len(self.path) - 1)
                 
             # Debug: Print path update information
             if closest_idx > self.path_index:
@@ -2206,7 +2890,7 @@ class Controller:
         error_scale = min(2.0, 1.0 + tracking_error)  # Allow up to 2x nominal limits
         max_accel = self.constants.MAX_ACCELERATION * error_scale
         max_vel = self.constants.MAX_VELOCITY * error_scale
-        max_torque = 5000.0 * error_scale  # Increase torque limits proportionally
+        max_torque = 8000.0 * error_scale  # Increase torque limits proportionally
         
         # Compute adaptive gains
         kp = self._compute_adaptive_gain(self.base_kp, tracking_error) 
@@ -2438,327 +3122,954 @@ class Controller:
         if closest_idx > self.path_index:
             self.path_index = closest_idx
 
-class TimeOptimalTrajectoryPlanner:
-    def __init__(self, robot: Robot):
-        self.robot = robot
-        self.constants = robot.constants
-        self.ds = 0.01  # Path parameterization resolution
-        self.s_grid = None
-        self.sdot_grid = None
-        self.sdot_max = 5.0  # Initial guess for max velocity
-        
-    def compute_dynamics_matrices(self, theta_0: float, theta_1: float, dtheta_0: float, dtheta_1: float) -> Tuple[float, float, float]:
-        """Compute m(s), c(s), g(s) for path-constrained dynamics"""
-        # Get path derivatives
-        dtheta = np.array([dtheta_0, dtheta_1])
-        
-        # Get full robot dynamics matrices
-        M, C, G = self.robot.compute_dynamics(theta_0, theta_1, 0, 0)
-        
-        # Compute path-specific terms
-        m = float(dtheta.T @ M @ dtheta)  # Scalar mass term
-        c = float(dtheta.T @ C @ dtheta)  # Velocity coefficient
-        g = float(dtheta.T @ G)  # Gravity term
-        
-        return m, c, g
 
-    def compute_acceleration_limits(self, s: float, s_dot: float, path: List[State]) -> Tuple[float, float]:
-        """Compute feasible acceleration range at given state"""
-        if not path:
-            return -self.constants.MAX_ACCELERATION, self.constants.MAX_ACCELERATION
+class VelocityProfileGenerator:
+    def __init__(self, max_vel: float, max_acc: float, debug_helper=None):
+        """Initialize velocity profile generator with constraints."""
+        self.max_vel = abs(max_vel)
+        self.max_acc = abs(max_acc)
+        self.epsilon = 1e-6
+        self.sub_profiles = []
+        self.debug_helper = debug_helper
+        
+    def set_profile(self, init_pos: float, final_pos: float, init_vel: float, final_vel: float, init_time: float = 0.0) -> bool:
+        """Generate velocity profile for given boundary conditions."""
+        if self.debug_helper:
+            self.debug_helper.log_state(f"\nVelocityProfile - Generating profile:")
+            self.debug_helper.log_state(f"Initial position: {init_pos:.3f}")
+            self.debug_helper.log_state(f"Final position: {final_pos:.3f}")
+            self.debug_helper.log_state(f"Initial velocity: {init_vel:.3f}")
+            self.debug_helper.log_state(f"Final velocity: {final_vel:.3f}")
+            self.debug_helper.log_state(f"Max velocity: {self.max_vel:.3f}")
+            self.debug_helper.log_state(f"Max acceleration: {self.max_acc:.3f}")
 
-        # Get path parameters at s
-        idx = int(s / self.ds)
-        idx = min(idx, len(path)-1)
-        state = path[idx]
-        next_idx = min(idx + 1, len(path)-1)
-        next_state = path[next_idx]
+        # Reset profiles
+        self.sub_profiles = []
         
-        # Get path derivatives
-        ds = self.ds
-        dtheta_0 = (next_state.theta_0 - state.theta_0) / ds
-        dtheta_1 = (next_state.theta_1 - state.theta_1) / ds
+        # Validate velocities
+        if abs(init_vel) > self.max_vel or abs(final_vel) > self.max_vel:
+            if self.debug_helper:
+                self.debug_helper.log_state("ERROR: Initial/final velocities exceed maximum")
+            return False
+            
+        # Calculate critical trajectory parameters
+        delta_pos = final_pos - init_pos  # Distance to cover
+        delta_vel = final_vel - init_vel  # Velocity change
+        mean_vel = (final_vel + init_vel) / 2
+        tf_crit = abs(delta_vel / self.max_acc)  # Critical time
+        pos_crit = mean_vel * tf_crit  # Critical distance
+
+        if self.debug_helper:
+            self.debug_helper.log_state(f"\nCritical parameters:")
+            self.debug_helper.log_state(f"Delta position: {delta_pos:.3f}")
+            self.debug_helper.log_state(f"Delta velocity: {delta_vel:.3f}")
+            self.debug_helper.log_state(f"Mean velocity: {mean_vel:.3f}")
+            self.debug_helper.log_state(f"Critical time: {tf_crit:.3f}")
+            self.debug_helper.log_state(f"Critical position: {pos_crit:.3f}")
         
-        # Get dynamics matrices
-        m, c, g = self.compute_dynamics_matrices(state.theta_0, state.theta_1, 
-                                               dtheta_0, dtheta_1)
-        
-        # Compute limits for each joint
-        tau_max = 5.0  # Maximum joint torque
-        tau_min = -5.0  # Minimum joint torque
-        
-        # Acceleration limits from dynamics
-        if abs(m) > 1e-6:  # Check for non-zero mass
-            a_min = (tau_min - c * s_dot**2 - g) / m
-            a_max = (tau_max - c * s_dot**2 - g) / m
+        # Determine trajectory direction
+        traj_sign = 0.0
+        if delta_pos > pos_crit + self.epsilon:
+            traj_sign = 1.0
+        elif delta_pos < pos_crit - self.epsilon:
+            traj_sign = -1.0
+        elif delta_vel > self.epsilon:
+            traj_sign = 1.0
+        elif delta_vel < -self.epsilon:
+            traj_sign = -1.0
+            
+        if self.debug_helper:
+            self.debug_helper.log_state(f"\nTrajectory sign: {traj_sign}")
+            
+        if traj_sign == 0.0:
+            if self.debug_helper:
+                self.debug_helper.log_state("Target already reached - generating steady state profile")
+            # Target already reached
+            self._add_profile(init_time, init_pos, init_vel, 0.0)
+            return True
+            
+        # Calculate peak velocity
+        peak_vel = np.sqrt(abs(traj_sign * delta_pos * self.max_acc + 
+                          (init_vel**2 + final_vel**2) / 2))
+                          
+        if self.debug_helper:
+            self.debug_helper.log_state(f"Peak velocity: {peak_vel:.3f}")
+                          
+        if peak_vel < self.max_vel:
+            if self.debug_helper:
+                self.debug_helper.log_state("\nGenerating triangular profile")
+            # Triangular profile
+            T20 = (traj_sign * peak_vel - init_vel) / (traj_sign * self.max_acc)
+            
+            # Acceleration phase
+            self._add_profile(init_time, init_pos, init_vel, traj_sign * self.max_acc)
+            
+            # Calculate intermediate position
+            pos_T20 = init_pos + T20 * (init_vel + 0.5 * T20 * traj_sign * self.max_acc)
+            
+            if self.debug_helper:
+                self.debug_helper.log_state(f"T20: {T20:.3f}")
+                self.debug_helper.log_state(f"Intermediate position: {pos_T20:.3f}")
+            
+            # Deceleration phase  
+            self._add_profile(init_time + T20, pos_T20, traj_sign * peak_vel, -traj_sign * self.max_acc)
+            
         else:
-            a_min = -self.constants.MAX_ACCELERATION
-            a_max = self.constants.MAX_ACCELERATION
+            if self.debug_helper:
+                self.debug_helper.log_state("\nGenerating trapezoidal profile")
+            # Trapezoidal profile
+            T20 = (traj_sign * self.max_vel - init_vel) / (traj_sign * self.max_acc)
+            T30 = (1.0 / self.max_vel) * (traj_sign * delta_pos + 
+                  (final_vel**2 + init_vel**2 - traj_sign * 2 * self.max_vel * init_vel) / (2 * self.max_acc))
             
-        # Additional kinematic limits
-        v_max = self.constants.MAX_VELOCITY
-        v_min = -v_max
-        
-        # Acceleration needed to stay within velocity limits
-        remaining_dist = max(1.0 - s, 0.01)  # Avoid division by zero
-        a_v = -(s_dot**2) / (2 * remaining_dist)  # Deceleration to stop
-        
-        # Return bounded acceleration limits
-        return max(a_min, a_v, -self.constants.MAX_ACCELERATION), min(a_max, self.constants.MAX_ACCELERATION)
+            if self.debug_helper:
+                self.debug_helper.log_state(f"T20: {T20:.3f}")
+                self.debug_helper.log_state(f"T30: {T30:.3f}")
+            
+            # Acceleration phase
+            self._add_profile(init_time, init_pos, init_vel, traj_sign * self.max_acc)
+            
+            # Calculate position at T20
+            pos_T20 = init_pos + T20 * (init_vel + 0.5 * T20 * traj_sign * self.max_acc)
+            
+            # Constant velocity phase
+            self._add_profile(init_time + T20, pos_T20, traj_sign * self.max_vel, 0.0)
+            
+            # Calculate position at T30
+            pos_T30 = pos_T20 + (T30 - T20) * traj_sign * self.max_vel
+            
+            if self.debug_helper:
+                self.debug_helper.log_state(f"Position at T20: {pos_T20:.3f}")
+                self.debug_helper.log_state(f"Position at T30: {pos_T30:.3f}")
+            
+            # Deceleration phase
+            self._add_profile(init_time + T30, pos_T30, traj_sign * self.max_vel, -traj_sign * self.max_acc)
+            
+        # Add final steady state profile
+        final_time = self.duration + abs(final_vel) / self.max_acc
+        final_position = final_pos + 0.5 * final_vel * abs(final_vel) / self.max_acc
+        self._add_profile(final_time, final_position, 0.0, 0.0)
 
-    def find_switch_points(self, forward_traj: List[Tuple[float, float]], 
-                          backward_traj: List[Tuple[float, float]]) -> List[Tuple[float, float]]:
-        """Find intersection points between forward and backward trajectories"""
-        if not forward_traj or not backward_traj:
-            return []
-
-        switch_points = []
-        forward = np.array(forward_traj)
-        backward = np.array(backward_traj)
+        if self.debug_helper:
+            self.debug_helper.log_state(f"\nFinal profile parameters:")
+            self.debug_helper.log_state(f"Final time: {final_time:.3f}")
+            self.debug_helper.log_state(f"Final position: {final_position:.3f}")
+            self.debug_helper.log_state(f"Number of sub-profiles: {len(self.sub_profiles)}")
+            
+        return True
         
-        for i in range(len(forward)-1):
-            for j in range(len(backward)-1):
-                s1, v1 = forward[i]
-                s2, v2 = forward[i+1]
-                s3, v3 = backward[j]
-                s4, v4 = backward[j+1]
+    def _add_profile(self, t0: float, p0: float, v0: float, a: float):
+        """Add a motion profile segment."""
+        self.sub_profiles.append([t0, p0, v0, a])
+        if self.debug_helper:
+            self.debug_helper.log_state(f"Added profile segment: t0={t0:.3f}, p0={p0:.3f}, v0={v0:.3f}, a={a:.3f}")
+        
+    @property 
+    def duration(self) -> float:
+        """Get profile duration."""
+        if not self.sub_profiles:
+            return 0.0
+        return self.sub_profiles[-1][0]
+        
+    def get_state_at_time(self, t: float) -> tuple:
+        """Get position, velocity and acceleration at time t."""
+        for i in range(len(self.sub_profiles) - 1):
+            if t >= self.sub_profiles[i][0] and t < self.sub_profiles[i+1][0]:
+                # Get profile parameters
+                t0, p0, v0, a = self.sub_profiles[i]
+                dt = t - t0
                 
-                # Line segment intersection
-                denominator = (s4-s3)*(v2-v1) - (v4-v3)*(s2-s1)
-                if abs(denominator) > 1e-6:  # Non-parallel segments
-                    t = ((s4-s3)*(v3-v1) - (v4-v3)*(s3-s1)) / denominator
-                    if 0 <= t <= 1:
-                        s = s1 + t*(s2-s1)
-                        v = v1 + t*(v2-v1)
-                        switch_points.append((s, v))
+                # Calculate state
+                p = p0 + v0*dt + 0.5*a*dt*dt
+                v = v0 + a*dt
+                return p, v, a
+                
+        # Return final state if beyond duration
+        return (self.sub_profiles[-1][1], 
+                self.sub_profiles[-1][2],
+                self.sub_profiles[-1][3])
+
+class PathParameterizer:
+    """Converts discrete path points to continuous path with derivatives"""
+    def __init__(self, path_points: List[State]):
+        if not path_points:
+            raise ValueError("Path points list cannot be empty")
+        if len(path_points) < 2:
+            raise ValueError("Need at least 2 path points for interpolation")
+            
+        self.original_points = path_points
+        
+        # Create more points for better interpolation
+        num_points = max(len(path_points) * 2, 200)  # Ensure enough points for smooth interpolation
+        self.s_points = np.linspace(0, 1, num_points)
+        
+        # Extract theta values and velocities
+        self.theta_0_points = [p.theta_0 for p in path_points]
+        self.theta_1_points = [p.theta_1 for p in path_points]
+        self.omega_0_points = [p.omega_0 for p in path_points]
+        self.omega_1_points = [p.omega_1 for p in path_points]
+        
+        # Original s values for the path points
+        original_s = np.linspace(0, 1, len(path_points))
+        
+        # Create interpolators with proper boundary handling
+        self.theta_0_spline = scipy.interpolate.CubicSpline(
+            original_s, self.theta_0_points, 
+            bc_type='clamped'
+        )
+        self.theta_1_spline = scipy.interpolate.CubicSpline(
+            original_s, self.theta_1_points,
+            bc_type='clamped'
+        )
+        
+        # Create velocity interpolators
+        self.omega_0_spline = scipy.interpolate.CubicSpline(
+            original_s, self.omega_0_points,
+            bc_type='clamped'
+        )
+        self.omega_1_spline = scipy.interpolate.CubicSpline(
+            original_s, self.omega_1_points,
+            bc_type='clamped'
+        )
+
+    def get_path_point(self, s: float) -> PathPoint:
+        """Get path point and its derivatives at given s"""
+        s = np.clip(s, 0, 1)  # Ensure s is in valid range
+            
+        # Get position
+        theta_0 = float(self.theta_0_spline(s))
+        theta_1 = float(self.theta_1_spline(s))
+        
+        # Get first derivatives (dtheta/ds)
+        dtheta_0 = float(self.theta_0_spline.derivative(1)(s))
+        dtheta_1 = float(self.theta_1_spline.derivative(1)(s))
+        
+        # Get second derivatives (d²theta/ds²)
+        ddtheta_0 = float(self.theta_0_spline.derivative(2)(s))
+        ddtheta_1 = float(self.theta_1_spline.derivative(2)(s))
+        
+        return PathPoint(s, theta_0, theta_1, dtheta_0, dtheta_1, ddtheta_0, ddtheta_1)
+
+class TimeOptimalTrajectoryGenerator:
+    def __init__(self, robot: Robot, path_points: List[State]):
+        self.robot = robot
+        self.tolerance = 1e-4  # Tolerance for binary search
+        self.debug = DebugHelper(debug=True)
+        self.debug.print_trajectory_header()
+        # Initialize path parameterizer with the path points
+        self.path = PathParameterizer(path_points)
+        # Cache for dynamics calculations
+        self.cached_dynamics = {}
+        
+    def compute_dynamics_at_s(self, s: float, omega_0: float = 0.0, omega_1: float = 0.0) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Compute M, C, G matrices with caching"""
+        
+        if len(self.cached_dynamics) > 1000000:
+            self._prune_cache()
+        
+        # Round to reduce cache misses from floating point errors
+        cache_key = (round(s, 4), round(omega_0, 4), round(omega_1, 4))
+        if cache_key in self.cached_dynamics:
+            cached_M, cached_C, cached_G = self.cached_dynamics[cache_key]
+            # self.debug.log_state(f"Using cached dynamics at s={s:.3f}:")
+            # self.debug.log_state(f"  M matrix:\n{cached_M}")
+            # self.debug.log_state(f"  C matrix:\n{cached_C}")
+            # self.debug.log_state(f"  G vector:\n{cached_G}")
+            return cached_M, cached_C, cached_G
+            
+        point = self.path.get_path_point(s)
+        M, C, G = self.robot.compute_dynamics(point.theta_0, point.theta_1, omega_0, omega_1)
+        
+        # self.debug.log_state(f"Computing dynamics at s={s:.3f}:")
+        # self.debug.log_state(f"  M matrix:\n{M}")
+        # self.debug.log_state(f"  C matrix:\n{C}")
+        # self.debug.log_state(f"  G vector:\n{G}")
+        
+        # Cache result
+        self.cached_dynamics[cache_key] = (M, C, G)
+
+       
+        return M, C, G
+        
+    def _prune_cache(self):
+        """
+        Prunes the dynamics cache to prevent unbounded memory growth.
+        Uses a combination of recency and relevance to determine which entries to keep.
+        """
+        # Maximum cache size
+        MAX_CACHE_SIZE = 1000000
+        REDUCTION_FACTOR = 0.75  # Remove 25% of cache when pruning
+        TARGET_SIZE = int(MAX_CACHE_SIZE * REDUCTION_FACTOR)
+
+        if len(self.cached_dynamics) <= TARGET_SIZE:
+            return
+
+        # Sort cache entries by their relevance score
+        sorted_entries = sorted(
+            self.cached_dynamics.items(),
+            key=lambda x: self._compute_cache_score(x[0]),
+            reverse=True  # Higher scores are more relevant
+        )
+
+        # Keep only the most relevant entries
+        self.cached_dynamics = dict(sorted_entries[:TARGET_SIZE])
+
+    def _compute_cache_score(self, cache_key: Tuple[float, float, float]) -> float:
+        """
+        Compute a relevance score for a cache entry.
+        Higher scores mean the entry is more important to keep.
+        
+        Args:
+            cache_key: Tuple of (s, omega_0, omega_1)
+        
+        Returns:
+            float: Relevance score, higher is more relevant
+        """
+        s, omega_0, omega_1 = cache_key
+        
+        # Parameters for scoring
+        s_weight = 1.0          # Weight for path parameter distance from endpoints
+        velocity_weight = 0.5   # Weight for velocity magnitudes
+        
+        # Compute distance from endpoints (s=0 or s=1)
+        # Points near endpoints are more important
+        endpoint_distance = min(abs(s), abs(1.0 - s))
+        s_score = 1.0 - endpoint_distance
+        
+        # Velocity score - lower velocities are more important 
+        # as they're often critical points
+        velocity_magnitude = np.sqrt(omega_0**2 + omega_1**2)
+        velocity_score = 1.0 / (1.0 + velocity_magnitude)
+        
+        # Combine scores
+        total_score = (s_weight * s_score + 
+                      velocity_weight * velocity_score) / (s_weight + velocity_weight)
+                      
+        return total_score
+
+    def compute_m(self, s: float) -> np.ndarray:
+        """Compute m(s) from equation (9.32)"""
+        point = self.path.get_path_point(s)
+        M, _, _ = self.compute_dynamics_at_s(s)
+        dtheta = np.array([point.dtheta_0, point.dtheta_1])
+        m = M @ dtheta
+        # self.debug.log_state(f"Computing m(s) at s={s:.3f}:")
+        # self.debug.log_state(f"  dtheta: {dtheta}")
+        # self.debug.log_state(f"  m(s): {m}")
+        return m
+    
+    def compute_g(self, s: float) -> np.ndarray:
+        """Get g(s) from dynamics"""
+        _, _, G = self.compute_dynamics_at_s(s)
+        return G
+
+    def compute_christoffel_symbols(self, theta_0: float, theta_1: float) -> np.ndarray:
+        """
+        Compute Christoffel symbols from mass matrix partial derivatives.
+        Returns a 2x2x2 tensor of Christoffel symbols.
+        """
+        # Get mass matrix at current configuration
+        M, _, _ = self.robot.compute_dynamics(theta_0, theta_1, 0, 0)
+        
+        # Compute partial derivatives of mass matrix
+        h = 1e-6  # Step size for numerical differentiation
+        
+        # ∂M/∂θ₀
+        M_plus_0 = self.robot.compute_dynamics(theta_0 + h, theta_1, 0, 0)[0]
+        M_minus_0 = self.robot.compute_dynamics(theta_0 - h, theta_1, 0, 0)[0]
+        dM_dtheta0 = (M_plus_0 - M_minus_0) / (2*h)
+        
+        # ∂M/∂θ₁
+        M_plus_1 = self.robot.compute_dynamics(theta_0, theta_1 + h, 0, 0)[0]
+        M_minus_1 = self.robot.compute_dynamics(theta_0, theta_1 - h, 0, 0)[0]
+        dM_dtheta1 = (M_plus_1 - M_minus_1) / (2*h)
+        
+        # Initialize Christoffel symbols tensor (2x2x2)
+        Gamma = np.zeros((2, 2, 2))
+        
+        # Compute inverse mass matrix
+        M_inv = np.linalg.inv(M)
+        
+        # Construct Christoffel symbols using the standard formula:
+        # Γᵏᵢⱼ = 1/2 * M⁻¹ᵏˡ * (∂Mᵢₗ/∂qⱼ + ∂Mⱼₗ/∂qᵢ - ∂Mᵢⱼ/∂qₗ)
+        for k in range(2):
+            for i in range(2):
+                for j in range(2):
+                    for l in range(2):
+                        # Get partial derivatives
+                        if l == 0:
+                            dM_dq = dM_dtheta0
+                        else:
+                            dM_dq = dM_dtheta1
+                            
+                        term1 = dM_dq[i, l]  # ∂Mᵢₗ/∂qⱼ
+                        term2 = dM_dq[j, l]  # ∂Mⱼₗ/∂qᵢ
                         
-        return switch_points
+                        if j == 0:
+                            term3 = dM_dtheta0[i, j]  # ∂Mᵢⱼ/∂qₗ
+                        else:
+                            term3 = dM_dtheta1[i, j]
+                            
+                        Gamma[k, i, j] += 0.5 * M_inv[k, l] * (term1 + term2 - term3)
+        
+        return Gamma
 
-    def compute_velocity_limit(self, s: float, path: List[State]) -> float:
-        """Compute maximum feasible velocity at position s"""
-        if not path:
-            return 0.0
-            
-        # Get state at s
-        idx = int(s / self.ds)
-        if idx >= len(path):
-            return 0.0
-        state = path[idx]
+    def compute_c(self, s: float, s_dot: float) -> np.ndarray:
+        # ------------ christoffel formula --------
+        point = self.path.get_path_point(s)
+        M, _, _ = self.compute_dynamics_at_s(s)
         
-        # Get dynamics constraints
-        m, c, g = self.compute_dynamics_matrices(state.theta_0, state.theta_1,
-                                               state.omega_0, state.omega_1)
+        # Get path derivatives
+        dtheta = np.array([point.dtheta_0, point.dtheta_1])
+        ddtheta = np.array([point.ddtheta_0, point.ddtheta_1])
         
-        # Handle zero/near-zero mass case
-        if abs(m) < 1e-6:
-            return self.constants.MAX_VELOCITY * (1.0 - s)  # Linear falloff
+        # Get Christoffel symbols at current configuration
+        Gamma = self.compute_christoffel_symbols(point.theta_0, point.theta_1)
         
-        # Maximum deceleration available
-        tau_min = -5.0
-        a_max_brake = abs((tau_min - g) / m)
+        # Compute M(θ)θ̈
+        term1 = M @ ddtheta
         
-        # Ensure reasonable deceleration limit
-        a_max_brake = min(a_max_brake, self.constants.MAX_ACCELERATION)
-        
-        # Compute velocity limit considering stopping distance
-        remaining_distance = max(1.0 - s, 1e-6)  # Avoid zero distance
-        v_limit = np.sqrt(2 * a_max_brake * remaining_distance)
-        
-        return min(v_limit, self.constants.MAX_VELOCITY)
+        # Compute quadratic velocity terms using Christoffel symbols
+        term2 = np.zeros(2)
+        for i in range(2):
+            for j in range(2):
+                for k in range(2):
+                    term2[i] += Gamma[i, j, k] * dtheta[j] * dtheta[k]
 
-    def integrate_dynamics(self, s0: float, s_dot0: float, forward: bool,
-                         path: List[State]) -> List[Tuple[float, float]]:
-        """Integrate dynamics with guaranteed stopping"""
-        if not path:
-            return []
-
-        trajectory = [(s0, s_dot0)]
-        s = s0
-        s_dot = s_dot0
+        return term1 + term2
+        # """Compute c(s) using relaxation formula"""
+        # point = self.path.get_path_point(s)
+        # dtheta = np.array([point.dtheta_0, point.dtheta_1])
+        # ddtheta = np.array([point.ddtheta_0, point.ddtheta_1])
+        # omega_0 = point.dtheta_0 * s_dot
+        # omega_1 = point.dtheta_1 * s_dot
         
-        while 0 <= s <= 1.0 and len(trajectory) < 1000:  # Add maximum iterations
-            # Get velocity limit
-            v_limit = self.compute_velocity_limit(s, path)
-            s_dot = min(s_dot, v_limit)
-            
-            if s_dot < 1e-6:  # Effectively zero velocity
-                break
+        # M, C, _ = self.compute_dynamics_at_s(s, omega_0, omega_1)
+        
+        # # Compute c(s) = M * θ''(s) + C * θ'(s) * s_dot
+        # c = M @ ddtheta + C @ dtheta
+        
+        # # self.debug.log_state(f"Computing c(s) at s={s:.3f}, s_dot={s_dot:.3f}:")
+        # # self.debug.log_state(f"  dtheta: {dtheta}")
+        # # self.debug.log_state(f"  ddtheta: {ddtheta}")
+        # # self.debug.log_state(f"  c(s): {c}")
+        # return c
+    
+    def compute_limits(self, s: float, s_dot: float) -> Tuple[float, float]:
+        """Compute L(s,s_dot) and U(s,s_dot) from equation (9.36)"""
+        # self.debug.log_state(f"\nComputing limits at s={s:.3f}, s_dot={s_dot:.3f}")
+        
+        m = self.compute_m(s)
+        c = self.compute_c(s, s_dot)
+        g = self.compute_g(s)
+        
+        # self.debug.log_state(f"Components for limit calculation:")
+        # self.debug.log_state(f"  m: {m}")
+        # self.debug.log_state(f"  c: {c}")
+        # self.debug.log_state(f"  g: {g}")
+        
+        # Initialize with the robot's acceleration limits
+        L = -self.robot.constants.MAX_ACCELERATION
+        U = self.robot.constants.MAX_ACCELERATION
+        
+        for i in range(len(m)):
+            if abs(m[i]) < self.tolerance:
+                # self.debug.log_state(f"  Joint {i}: Zero inertia case, skipping")
+                continue
                 
-            a_min, a_max = self.compute_acceleration_limits(s, s_dot, path)
+            c_term = c[i] * s_dot**2
             
-            # Choose acceleration based on direction
-            if forward:
-                # When approaching end, force deceleration
-                if s > 0.9:  # Start final deceleration phase
-                    a = a_min  # Use minimum acceleration to stop
-                else:
-                    a = a_max
+            # Get velocity limits for current joint
+            accel_max = self.robot.constants.MAX_ACCELERATION
+            accel_min = -self.robot.constants.MAX_ACCELERATION
+            
+            if m[i] > 0:
+                Li = (accel_min - c_term - g[i]) / m[i]
+                Ui = (accel_max - c_term - g[i]) / m[i]
             else:
-                a = a_min
+                Li = (accel_max - c_term - g[i]) / m[i]
+                Ui = (accel_min - c_term - g[i]) / m[i]
+                
+            # self.debug.log_state(f"  Joint {i} limits:")
+            # self.debug.log_state(f"    c_term: {c_term:.3f}")
+            # self.debug.log_state(f"    Li: {Li:.3f}")
+            # self.debug.log_state(f"    Ui: {Ui:.3f}")
+                
+            L = max(L, Li)
+            U = min(U, Ui)
             
-            # Integration step
-            s_dot_next = max(0, min(s_dot + a * self.ds, self.constants.MAX_VELOCITY))  # Bound velocity
-            s_next = s + s_dot * self.ds + 0.5 * a * self.ds**2
+        # Ensure we don't exceed robot's acceleration limits
+        L = max(L, -self.robot.constants.MAX_ACCELERATION)
+        U = min(U, self.robot.constants.MAX_ACCELERATION)
+        
+        # self.debug.log_state(f"Final limits: L={L:.3f}, U={U:.3f}")
+        return L, U
+    
+    def find_switch_points(self) -> List[Tuple[float, float, TrajectoryType]]:
+        """Optimized switch point search with adaptive step size"""
+        self.debug.log_state("\n=== Starting Switch Point Search ===")
+        switches = []
+        s_current = 0.0
+        s_dot_current = 0.0
+        
+        # Start with larger initial step
+        step_size = 0.15  
+        min_step = 0.07
+        growth_factor = 1.5
+        reduction_factor = 0.5
+        self.debug.log_state(f"Starting from (s={s_current}, s_dot={s_dot_current})")
+        
+        # Integrate backward curve once at start
+        self.debug.log_state("\nStep 2: Integrating backward from end point")
+        t_backward, backward = self.integrate_trajectory(1.0, 0.0, False, (0, 10.0))
+        
+        if backward.size == 0:
+            self.debug.log_state("Warning: Backward integration produced no points")
+            return []
             
-            if not (0 <= s_next <= 1.0):  # Check bounds
+        final_curve = backward
+        self.debug.log_state(f"Generated {len(final_curve[0])} points on final curve")
+        
+        # Use adaptive step size
+        iteration = 0
+        max_iterations = 50  # Reduced max iterations
+        
+        while s_current < 1.0 and iteration < max_iterations:
+            iteration += 1
+            self.debug.log_state(f"\n=== Iteration {iteration} ===")
+            self.debug.log_state(f"Current state: (s={s_current:.3f}, s_dot={s_dot_current:.3f})")
+            self.debug.log_state(f"Current step size: {step_size:.3f}")
+            
+            # Forward integration
+            self.debug.log_state("\nForward integration with maximum acceleration")
+            t_forward, forward = self.integrate_trajectory(s_current, s_dot_current, True, (0, 10.0))
+            
+            # Check for intersection and violations
+            intersection = self.detect_curve_intersection(forward, final_curve)
+            violation = self.check_velocity_limit_violation(forward)
+            
+            if violation is None and intersection is not None:
+                s_switch, s_dot_switch = intersection
+                self.debug.log_state(f"Found intersection at (s={s_switch:.3f}, s_dot={s_dot_switch:.3f})")
+                
+                if abs(s_switch - s_current) > self.tolerance:
+                    switches.append((s_switch, s_dot_switch, TrajectoryType.DECELERATION))
+                    self.debug.log_state("Added deceleration switch point")
+                    s_current = s_switch
+                    s_dot_current = s_dot_switch
+                    # No violation - increase step size
+                    step_size = min(0.15, step_size * growth_factor)
+                else:
+                    self.debug.log_state("Switch point too close to current point, advancing")
+                    s_current += step_size
+                    s_dot_current = 0.0
+                    
+            elif violation is not None:
+                s_lim, s_dot_lim = violation
+                # Violation found - reduce step size and refine search
+                step_size = max(min_step, step_size * reduction_factor)
+                self.debug.log_state(f"Found velocity limit violation at (s={s_lim:.3f}, s_dot={s_dot_lim:.3f})")
+                
+                if s_lim <= s_current + self.tolerance:
+                    self.debug.log_state("Violation point is behind or too close, advancing")
+                    s_current += step_size
+                    s_dot_current = 0.0
+                    continue
+                
+                # Binary search for tangent point
+                self.debug.log_state("\nPerforming binary search for tangent point")
+                s_tan, s_dot_tan = self.binary_search_velocity(s_lim, s_dot_lim)
+                self.debug.log_state(f"Found tangent point at (s={s_tan:.3f}, s_dot={s_dot_tan:.3f})")
+                
+                if abs(s_tan - s_current) <= self.tolerance:
+                    self.debug.log_state("Tangent point too close to current point, advancing")
+                    s_current += step_size
+                    s_dot_current = 0.0
+                    continue
+                
+                # Backward integration from tangent point
+                self.debug.log_state("\nIntegrating backward from tangent point")
+                t_back, back = self.integrate_trajectory(s_tan, s_dot_tan, False, (0, 10.0))
+                
+                intersection = self.detect_curve_intersection(back, forward)
+                if intersection is not None:
+                    s_switch, s_dot_switch = intersection
+                    self.debug.log_state(f"Found intersection with forward curve at (s={s_switch:.3f}, s_dot={s_dot_switch:.3f})")
+                    
+                    if abs(s_switch - s_current) > self.tolerance:
+                        switches.append((s_switch, s_dot_switch, TrajectoryType.DECELERATION))
+                        switches.append((s_tan, s_dot_tan, TrajectoryType.ACCELERATION))
+                        self.debug.log_state("Added deceleration and acceleration switch points")
+                        s_current = s_tan
+                        s_dot_current = s_dot_tan
+                        step_size = max(min_step, step_size * 0.5)
+                    else:
+                        self.debug.log_state("Switch point too close to current point, advancing")
+                        s_current += step_size
+                        s_dot_current = 0.0
+                else:
+                    self.debug.log_state("No intersection found with forward curve, advancing")
+                    s_current += step_size
+                    s_dot_current = 0.0
+                    step_size = min(0.15, step_size * 1.5)  # Increase step size when no intersection
+            else:
+                self.debug.log_state("No violation or intersection found, ending search")
                 break
                 
-            s = s_next
-            s_dot = s_dot_next
-            trajectory.append((s, s_dot))
+        self.debug.log_state(f"\nSwitch point search complete. Found {len(switches)} switch points:")
+        for i, (s, s_dot, switch_type) in enumerate(switches):
+            self.debug.log_state(f"Switch point {i+1}: (s={s:.3f}, s_dot={s_dot:.3f}, type={switch_type})")
             
-            # Check if effectively stopped
-            if not forward and s_dot < 1e-6:
+        return switches
+
+    def binary_search_velocity(self, s_lim: float, s_dot_lim: float) -> Tuple[float, float]:
+        """Optimized binary search with early convergence"""
+        self.debug.log_state(f"\nStarting binary search for velocity at s={s_lim:.3f}, s_dot_lim={s_dot_lim:.3f}")
+        
+        s_dot_low = 0.0
+        s_dot_high = s_dot_lim
+        best_point = None
+        
+        max_iterations = 20  # Reduced iterations
+        rel_tolerance = 1e-3  # Relative tolerance for early stopping
+        last_s_dot_test = s_dot_high;
+        for iteration in range(max_iterations):
+            s_dot_test = (s_dot_high + s_dot_low) / 2
+            self.debug.log_state(f"\nBinary search iteration {iteration + 1}:")
+            self.debug.log_state(f"  Testing s_dot={s_dot_test:.3f}")
+            
+            _, forward = self.integrate_trajectory(s_lim, s_dot_test, False, (0, 10.0))
+            violation_point = self.check_velocity_limit_violation(forward)
+            
+            if violation_point is not None:
+                self.debug.log_state(f"  Trajectory violates limits at {violation_point}")
+                s_dot_high = s_dot_test
+            else:
+                self.debug.log_state(f"  Trajectory respects limits")
+                s_dot_low = s_dot_test
+                best_point = (s_lim, s_dot_test)
+                
+            self.debug.log_state(f"  Updated bounds: [{s_dot_low:.3f}, {s_dot_high:.3f}]")
+            
+            # Early stopping if converged enough
+            if abs(s_dot_high - s_dot_low) < rel_tolerance * s_dot_lim or abs(s_dot_test - last_s_dot_test) < 5 * rel_tolerance:
+                self.debug.log_state("  Converged within relative tolerance")
                 break
-        
-        return trajectory
+            last_s_dot_test = s_dot_test
+                
+        final_point = best_point if best_point is not None else (s_lim, s_dot_low)
+        self.debug.log_state(f"Binary search complete. Found point: (s={final_point[0]:.3f}, s_dot={final_point[1]:.3f})")
+        return final_point
 
-    def generate_trajectory(self, path: List[State]) -> List[State]:
-        """Generate smoother trajectory with conservative velocity profile"""
-        if not hasattr(self, 'debug_helper'):
-            self.debug_helper = DebugHelper(debug=True)
+    def integrate_trajectory(self, s0: float, s_dot0: float, use_max: bool, t_span: Tuple[float, float]) -> Tuple[np.ndarray, np.ndarray]:
+        """Optimized trajectory integration with debug output"""
+        self.debug.log_state(f"\nIntegrating trajectory from s0={s0:.3f}, s_dot0={s_dot0:.3f}")
+        self.debug.log_state(f"Using {'maximum' if use_max else 'minimum'} acceleration")
+        
+        def dynamics(t: float, state: List[float]) -> List[float]:
+            s, s_dot = state
+            s = np.clip(s, 0, 1)
+                
+            try:
+                L, U = self.compute_limits(s, s_dot)
+                s_ddot = U if use_max else L
+                s_ddot = np.clip(s_ddot, 
+                               -self.robot.constants.MAX_ACCELERATION, 
+                               self.robot.constants.MAX_ACCELERATION)
+                               
+                # self.debug.log_state(f"  t={t:.3f}: s={s:.3f}, s_dot={s_dot:.3f}, s_ddot={s_ddot:.3f}")
+                return [s_dot, s_ddot]
+            except Exception as e:
+                self.debug.log_state(f"Error in dynamics: {e}")
+                return [0.0, 0.0]
 
-        self.debug_helper.print_trajectory_header()
+        # Adaptive step size based on path curvature
+        def get_timestep(s):
+            point = self.path.get_path_point(s)
+            curvature = abs(point.ddtheta_0) + abs(point.ddtheta_1)
+            return min(0.15, max(0.05, 0.15 / (1 + curvature)))
         
-        if not path:
-            self.debug_helper.log_state("Invalid trajectory - using fallback")
-            self.debug_helper.print_trajectory_stats(path, self.robot)
-            self.debug_helper.validate_trajectory_dynamics(path, self.robot)
-            self.debug_helper.print_trajectory_points(path, self.robot)
-            return path
-            
-        # Apply velocity smoothing
-        dt = self.constants.DT
-        smoothed = []
-        max_vel = self.constants.MAX_VELOCITY * 0.5  # Reduce max velocity
+        self.debug.log_state("Starting numerical integration...")
+        # Reduce number of evaluation points but keep fine resolution for debug
+        t_eval = np.linspace(t_span[0], t_span[1], 50)
         
-        # Start with zero velocity
-        smoothed.append(State(path[0].theta_0, path[0].theta_1, 0.0, 0.0))
+        solution = scipy.integrate.solve_ivp(
+            dynamics,
+            t_span,
+            [s0, s_dot0],
+            method='RK45',
+            max_step=get_timestep(s0), # Increased max step size
+            rtol=1e-2,     # Relaxed tolerance
+            atol=1e-2     # Relaxed tolerance
+            # t_eval=t_eval
+        )
         
-        # Ramp up velocities gradually
-        for i in range(1, len(path)-1):
-            # Compute desired velocity based on position difference
-            delta_theta_0 = path[i+1].theta_0 - path[i-1].theta_0
-            delta_theta_1 = path[i+1].theta_1 - path[i-1].theta_1
-            
-            # Scale velocities based on distance to goal
-            scale = max(0.1, float(i) / len(path))  # Gradually increase
-            omega_0 = np.clip(delta_theta_0 / (2*dt), -max_vel, max_vel) * scale
-            omega_1 = np.clip(delta_theta_1 / (2*dt), -max_vel, max_vel) * scale
-            
-            smoothed.append(State(path[i].theta_0, path[i].theta_1, omega_0, omega_1))
-            
-        # End with zero velocity
-        smoothed.append(State(path[-1].theta_0, path[-1].theta_1, 0.0, 0.0))
-        self.debug_helper.print_trajectory_stats(smoothed, self.robot)
-        self.debug_helper.validate_trajectory_dynamics(smoothed, self.robot)
-        self.debug_helper.print_trajectory_points(smoothed, self.robot)
+        if not solution.success:
+            self.debug.log_state(f"Integration failed: {solution.message}")
+            return np.array([t_span[0], t_span[1]]), np.array([[s0, s0], [s_dot0, 0.0]])
         
-        return smoothed
+        self.debug.log_state(f"Integration complete: {len(solution.t)} points generated")
+        
+        # Filter points
+        mask = (solution.y[0] >= 0) & (solution.y[0] <= 1)
+        if not np.any(mask):
+            self.debug.log_state("No points within valid range")
+            return np.array([0, 1]), np.array([[s0, 1.0], [s_dot0, 0.0]])
+            
+        t_filtered = solution.t[mask]
+        y_filtered = solution.y[:, mask]
+        
+        self.debug.log_state(f"Filtered trajectory: {len(t_filtered)} points")
+        return t_filtered, y_filtered
 
-    # def generate_trajectory(self, path: List[State]) -> List[State]:
-    #     """Generate time-optimal trajectory with guaranteed stop"""
-    #     if not hasattr(self, 'debug_helper'):
-    #         self.debug_helper = DebugHelper(debug=True)
+    def detect_curve_intersection(self, curve1: np.ndarray, curve2: np.ndarray) -> Optional[Tuple[float, float]]:
+        """Detect intersection between two phase-plane curves."""
+        self.debug.log_state("\nSearching for curve intersection")
         
-    #     self.debug_helper.print_trajectory_header()
+        # Ensure we have valid data
+        if curve1.size == 0 or curve2.size == 0:
+            self.debug.log_state("Invalid curve data")
+            return None
+            
+        # Extract time and state arrays
+        if len(curve1.shape) == 2 and curve1.shape[0] == 2:
+            s1, s_dot1 = curve1[0], curve1[1]
+        else:
+            self.debug.log_state("Invalid shape for curve1")
+            return None
+            
+        if len(curve2.shape) == 2 and curve2.shape[0] == 2:
+            s2, s_dot2 = curve2[0], curve2[1]
+        else:
+            self.debug.log_state("Invalid shape for curve2")
+            return None
+            
+        # Sort by s values
+        idx1 = np.argsort(s1)
+        idx2 = np.argsort(s2)
+        s1, s_dot1 = s1[idx1], s_dot1[idx1]
+        s2, s_dot2 = s2[idx2], s_dot2[idx2]
+        
+        # Find overlapping s range
+        s_min = max(np.min(s1), np.min(s2))
+        s_max = min(np.max(s1), np.max(s2))
+        
+        self.debug.log_state(f"Overlapping s range: [{s_min:.3f}, {s_max:.3f}]")
+        
+        if s_min >= s_max:
+            self.debug.log_state("No overlapping range found")
+            return None
+            
+        try:
+            # Interpolate both curves
+            f1 = scipy.interpolate.interp1d(s1, s_dot1, bounds_error=False)
+            f2 = scipy.interpolate.interp1d(s2, s_dot2, bounds_error=False)
+            
+            # Create a fine grid of points
+            s_points = np.linspace(s_min, s_max, 100)
+            v1 = f1(s_points)
+            v2 = f2(s_points)
+            
+            # Find where curves cross
+            mask = ~np.isnan(v1) & ~np.isnan(v2)
+            if not np.any(mask):
+                self.debug.log_state("No valid intersection points found")
+                return None
+                
+            s_points = s_points[mask]
+            v1 = v1[mask]
+            v2 = v2[mask]
+            
+            diff = v1 - v2
+            zero_crossings = np.where(np.diff(np.signbit(diff)))[0]
+            
+            if len(zero_crossings) == 0:
+                self.debug.log_state("No zero crossings found")
+                return None
+                
+            # Get the first intersection point
+            idx = zero_crossings[0]
+            s_intersect = s_points[idx]
+            s_dot_intersect = f1(s_intersect)
+            
+            self.debug.log_state(f"Found intersection at (s={s_intersect:.3f}, s_dot={s_dot_intersect:.3f})")
+            return (float(s_intersect), float(s_dot_intersect))
+            
+        except Exception as e:
+            self.debug.log_state(f"Error in intersection detection: {e}")
+            return None
 
-    #     if not path:
-    #         self.debug_helper.log_state("Empty path received")
-    #         return []
+    def check_velocity_limit_violation(self, trajectory: np.ndarray) -> Optional[Tuple[float, float]]:
+        """Check if trajectory violates velocity limits."""
+        self.debug.log_state("\nChecking for velocity limit violations")
+        
+        for i in range(len(trajectory[0])):
+            s = trajectory[0, i]
+            s_dot = trajectory[1, i]
+            L, U = self.compute_limits(s, s_dot)
             
-    #     self.debug_helper.log_state("Invalid trajectory - using fallback")
-    #     self.debug_helper.print_trajectory_stats(path, self.robot)
-    #     self.debug_helper.validate_trajectory_dynamics(path, self.robot)
-    #     self.debug_helper.print_trajectory_points(path, self.robot)
-    #     # Ensure minimum path length
-    #     if len(path) < 3:
-    #         return path
-            
-    #     try:
-    #         # Forward acceleration phase
-    #         forward_traj = self.integrate_dynamics(0, 0, True, path)
-    #         if not forward_traj:
-    #             return path
-            
-    #         # Backward deceleration phase starting from zero velocity
-    #         backward_traj = self.integrate_dynamics(1, 0, False, path)
-    #         if not backward_traj:
-    #             return path
-            
-    #         # Find switching points
-    #         switch_points = self.find_switch_points(forward_traj, backward_traj)
-    #         if not switch_points:
-    #             # If no intersection, try to find switch point from velocity curve
-    #             forward_points = [(s, v) for s, v in forward_traj if v > 0]
-    #             if forward_points:
-    #                 s_switch = max(s for s, v in forward_points)
-    #                 v_switch = min(v for s, v in forward_points if s <= s_switch)
-    #                 switch_points = [(s_switch, v_switch)]
-    #             else:
-    #                 return path
-            
-    #         # Generate final trajectory ensuring zero final velocity
-    #         optimal_traj = []
-            
-    #         # Add acceleration phase
-    #         for i, (s, v) in enumerate(forward_traj):
-    #             if not switch_points or s > switch_points[0][0]:
-    #                 break
-    #             state_idx = min(int(s / self.ds), len(path)-1)
-    #             state = path[state_idx]
-    #             optimal_traj.append(State(
-    #                 state.theta_0, state.theta_1,
-    #                 state.omega_0 * v, state.omega_1 * v
-    #             ))
-            
-    #         # Add deceleration phase
-    #         if switch_points:
-    #             for s, v in backward_traj[::-1]:
-    #                 if s < switch_points[-1][0]:
-    #                     break
-    #                 state_idx = min(int(s / self.ds), len(path)-1)
-    #                 state = path[state_idx]
-    #                 optimal_traj.append(State(
-    #                     state.theta_0, state.theta_1,
-    #                     state.omega_0 * v, state.omega_1 * v
-    #                 ))
-            
-    #         # Force deceleration near end
-    #         final_segment_length = max(len(path) // 4, 3)  # At least last 3 states or 25% of path
-    #         for i in range(final_segment_length):
-    #             idx = -(i + 1)
-    #             progress = i / final_segment_length
-    #             path[idx] = State(
-    #                 path[idx].theta_0,
-    #                 path[idx].theta_1,
-    #                 path[idx].omega_0 * (1 - progress),  # Linear velocity reduction
-    #                 path[idx].omega_1 * (1 - progress)
-    #             )
+            # Check if acceleration limits are violated
+            if L > U or s_dot < 0:
+                self.debug.log_state(f"Violation found at (s={s:.3f}, s_dot={s_dot:.3f})")
+                self.debug.log_state(f"  Limits at violation: L={L:.3f}, U={U:.3f}")
+                return (s, s_dot)
+        
+        self.debug.log_state("No velocity limit violations found")
+        return None
 
-    #         # Ensure final state has zero velocity
-    #         final_state = optimal_traj[-1]
-    #         optimal_traj[-1] = State(
-    #             final_state.theta_0, final_state.theta_1, 0.0, 0.0
-    #         )
+    def compute_optimal_velocity_at_s(self, s: float, switch_points: List[Tuple[float, float, TrajectoryType]]) -> float:
+        """Compute the optimal velocity at a given s based on switch points."""
+        self.debug.log_state(f"\nComputing optimal velocity at s={s:.3f}")
+        
+        # Find the relevant phase between switch points
+        current_phase = TrajectoryType.ACCELERATION
+        s_prev = 0.0
+        s_dot_prev = 0.0
+        
+        for s_switch, s_dot_switch, switch_type in switch_points:
+            if s < s_switch:
+                break
+            s_prev = s_switch
+            s_dot_prev = s_dot_switch
+            current_phase = switch_type
             
-    #         # Validate trajectory
-    #         if self.debug_helper.validate_trajectory(optimal_traj, self.robot):
-    #             self.debug_helper.log_state("Valid trajectory generated")
-    #             self.debug_helper.print_trajectory_stats(optimal_traj, self.robot)
-    #             self.debug_helper.validate_trajectory_dynamics(optimal_traj, self.robot)
-    #             self.debug_helper.print_trajectory_points(optimal_traj, self.robot)
-    #             return optimal_traj
-    #         else:
-    #             self.debug_helper.log_state("Invalid trajectory - using fallback")
-    #             self.debug_helper.print_trajectory_stats(path, self.robot)
-    #             self.debug_helper.validate_trajectory_dynamics(path, self.robot)
-    #             self.debug_helper.print_trajectory_points(path, self.robot)
-    #             return path
+        self.debug.log_state(f"Current phase: {current_phase}")
+        self.debug.log_state(f"Previous switch point: (s={s_prev:.3f}, s_dot={s_dot_prev:.3f})")
+        
+        # Integrate from previous switch point to current s
+        t_span = (0, 10.0)
+        _, trajectory = self.integrate_trajectory(s_prev, s_dot_prev, 
+                                               current_phase == TrajectoryType.ACCELERATION,
+                                               t_span)
+        
+        # Find s_dot at current s by interpolation
+        f = scipy.interpolate.interp1d(trajectory[0], trajectory[1])
+        s_dot = float(f(s))
+        
+        self.debug.log_state(f"Computed optimal velocity: s_dot={s_dot:.3f}")
+        return s_dot
+
+    def generate_trajectory(self, path_points: List[State]) -> List[State]:
+        """Generate time-optimal trajectory from path points."""        
+        if not path_points:
+            self.debug.log_state("Empty path points list")
+            return []
             
-    #     except Exception as e:
-    #         print(f"Error in trajectory generation: {e}")
-    #         return path  # Return original path on error
+        if len(path_points) == 1:
+            self.debug.log_state("Single point trajectory, returning zero velocity")
+            return [State(
+                theta_0=path_points[0].theta_0,
+                theta_1=path_points[0].theta_1,
+                omega_0=0.0,
+                omega_1=0.0
+            )]
+            
+        try:
+            # Preprocess path
+            self.debug.log_state("\nPreprocessing path points...")
+            cleaned_path = self.preprocess_path(path_points)
+            self.debug.log_state(f"Path reduced from {len(path_points)} to {len(cleaned_path)} points")
+            
+            # Initialize path parameterizer
+            self.debug.log_state("\nInitializing path parameterizer")
+            self.path = PathParameterizer(cleaned_path)
+            
+            # Find switch points
+            self.debug.log_state("\nFinding switch points...")
+            switch_points = self.find_switch_points()
+            self.debug.log_state(f"Found {len(switch_points)} switch points")
+            
+            # Generate final trajectory
+            self.debug.log_state("\nGenerating final trajectory...")
+            trajectory_points = []
+            
+            # Create more dense sampling near switch points
+            s_values = []
+            base_points = np.linspace(0, 1, max(100, len(cleaned_path) * 2))
+            
+            for s in base_points:
+                s_values.append(s)
+                # Add extra points near switch points
+                for s_switch, _, _ in switch_points:
+                    if abs(s - s_switch) < 0.05:
+                        s_values.extend([
+                            s_switch - 0.01,
+                            s_switch,
+                            s_switch + 0.01
+                        ])
+            
+            s_values = sorted(list(set(np.clip(s_values, 0, 1))))
+            self.debug.log_state(f"Generated {len(s_values)} trajectory points")
+            
+            for s in s_values:
+                try:
+                    point = self.path.get_path_point(s)
+                    s_dot = self.compute_optimal_velocity_at_s(s, switch_points)
+                    
+                    # Convert path parameter velocity to joint velocities
+                    omega_0 = point.dtheta_0 * s_dot
+                    omega_1 = point.dtheta_1 * s_dot
+                    
+                    # Ensure velocities are within bounds
+                    omega_0 = np.clip(omega_0, -self.robot.constants.MAX_VELOCITY, 
+                                            self.robot.constants.MAX_VELOCITY)
+                    omega_1 = np.clip(omega_1, -self.robot.constants.MAX_VELOCITY, 
+                                            self.robot.constants.MAX_VELOCITY)
+                    
+                    trajectory_points.append(State(
+                        theta_0=point.theta_0,
+                        theta_1=point.theta_1,
+                        omega_0=omega_0,
+                        omega_1=omega_1
+                    ))
+                except Exception as e:
+                    self.debug.log_state(f"Error generating trajectory point at s={s}: {e}")
+                    continue
+            
+            if not trajectory_points:
+                self.debug.log_state("Warning: Failed to generate any valid trajectory points")
+                return cleaned_path
+                
+            self.debug.log_state(f"Successfully generated trajectory with {len(trajectory_points)} points")
+            return trajectory_points
+            
+        except Exception as e:
+            self.debug.log_state(f"Error in trajectory generation: {e}")
+            return cleaned_path
+
+    def preprocess_path(self, path_points: List[State]) -> List[State]:
+        """
+        Clean up path by removing duplicate or nearly identical points.
+        Two points are considered nearly identical if their joint angles 
+        differ by less than a small threshold.
+        
+        Args:
+            path_points: Original list of path points
+            
+        Returns:
+            List[State]: Cleaned path with duplicates removed
+        """
+        if not path_points:
+            return []
+            
+        # Threshold for considering angles equal (in radians)
+        angle_threshold = 0.01  
+        
+        # Start with first point
+        cleaned_path = [path_points[0]]
+        prev_point = path_points[0]
+        
+        for current_point in path_points[1:]:
+            # Check if current point is significantly different from previous
+            theta0_diff = abs(current_point.theta_0 - prev_point.theta_0)
+            theta1_diff = abs(current_point.theta_1 - prev_point.theta_1)
+            
+            if theta0_diff > angle_threshold or theta1_diff > angle_threshold:
+                cleaned_path.append(current_point)
+                prev_point = current_point
+                
+        print(f"Path preprocessing: removed {len(path_points) - len(cleaned_path)} duplicate points")
+        return cleaned_path
 
 class Runner:
     """
@@ -2846,7 +4157,7 @@ def main() -> None:
         config = json.load(f)
 
     # Add gravity consideration to config
-    consider_gravity = False  # Set this to False for side-mounted links
+    consider_gravity = True  # Set this to False for side-mounted links
     config['robot']['consider_gravity'] = consider_gravity
 
     # Initialize robot constants
@@ -2878,8 +4189,10 @@ def main() -> None:
     #planner = SBPLLatticePlanner(robot, world)
     planner = AStarPlanner(robot, world)
 
+    #
+
     # Initialize controller
-    controller = Controller(robot_constants, world, planner)
+    controller = Controller(robot, world, planner)
 
     # Initialize visualizer
     visualizer = Visualizer(world, config)
@@ -2931,29 +4244,42 @@ class DebugHelper:
             print(msg)
             
     def validate_path_limits(self, path: List[State], robot: Robot) -> bool:
-        """Validate if path respects all joint and velocity limits"""
         if not path:
+            self.log_state("Empty path!")
             return False
-            
-        joint_limits = robot.constants.JOINT_LIMITS
-        vel_limit = robot.constants.MAX_VELOCITY
-        
-        for state in path:
+
+        # Analyze joint angles
+        for i, state in enumerate(path):
             # Check joint limits
-            if not (joint_limits[0] <= state.theta_0 <= joint_limits[1] and
-                   joint_limits[0] <= state.theta_1 <= joint_limits[1]):
-                if self.debug:
-                    print(f"Joint limits violated: theta0={state.theta_0:.2f}, theta1={state.theta_1:.2f}")
+            if not self.within_joint_limits(robot, (state.theta_0, state.theta_1)):
+                self.log_state(f"Joint limit violation at index {i}:")
+                self.log_state(f"θ0={state.theta_0:.3f}, θ1={state.theta_1:.3f}")
                 return False
-                
+
             # Check velocity limits
-            if abs(state.omega_0) > vel_limit or abs(state.omega_1) > vel_limit:
-                if self.debug:
-                    print(f"Velocity limits violated: omega0={state.omega_0:.2f}, omega1={state.omega_1:.2f}")
+            if abs(state.omega_0) > robot.constants.MAX_VELOCITY or \
+               abs(state.omega_1) > robot.constants.MAX_VELOCITY:
+                self.log_state(f"Velocity limit violation at index {i}:")
+                self.log_state(f"ω0={state.omega_0:.3f}, ω1={state.omega_1:.3f}")
                 return False
+
+            # Check accelerations if not first state
+            if i > 0:
+                alpha_0 = (state.omega_0 - path[i-1].omega_0) / robot.constants.DT
+                alpha_1 = (state.omega_1 - path[i-1].omega_1) / robot.constants.DT
                 
+                if abs(alpha_0) > robot.constants.MAX_ACCELERATION or \
+                   abs(alpha_1) > robot.constants.MAX_ACCELERATION:
+                    self.log_state(f"Acceleration limit violation at index {i}:")
+                    self.log_state(f"α0={alpha_0:.3f}, α1={alpha_1:.3f}")
+                    return False
         return True
 
+    
+    def within_joint_limits(self, robot: Robot, node: Tuple[float, float]) -> bool:
+        theta_0, theta_1 = node
+        return (robot.constants.JOINT_LIMITS[0] <= theta_0 <= robot.constants.JOINT_LIMITS[1] and
+                robot.constants.JOINT_LIMITS[0] <= theta_1 <= robot.constants.JOINT_LIMITS[1])
     def print_path_stats(self, path: List[State], robot: Robot):
         """Print detailed statistics about the planned path"""
         if not path:
@@ -3087,7 +4413,7 @@ class DebugHelper:
         print("\nLimit Checks:")
         vel_limit = robot.constants.MAX_VELOCITY
         acc_limit = robot.constants.MAX_ACCELERATION
-        torque_limit = 5.0  # Assumed torque limit
+        torque_limit = 1000.0  # Assumed torque limit
         
         vel_violations = sum(1 for v in omega0_vals + omega1_vals if abs(v) > vel_limit)
         acc_violations = sum(1 for a in alpha0_vals + alpha1_vals if abs(a) > acc_limit)
@@ -3134,8 +4460,8 @@ class DebugHelper:
         goal_error = np.hypot(end_pos[0] - goal[0], end_pos[1] - goal[1])
 
         if goal_error > 0.5:
-            if self.debug:
-                print(f"WARNING: Path ends far from goal. Error: {goal_error:.3f}")
+            # if self.debug:
+            #     print(f"WARNING: Path ends far from goal. Error: {goal_error:.3f}")
             return False
 
         # Validate limits
