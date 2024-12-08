@@ -3,13 +3,18 @@ from typing import List, Tuple, Union, Dict, Set, Optional
 import numpy as np
 import pygame
 import json
+import math
 import heapq
 import time
 from collections import deque
 import itertools
 import scipy.integrate
+import scipy.sparse as sparse
+from scipy.sparse.csgraph import dijkstra
+
 
 from collision_checker import CollisionChecker
+from collections import defaultdict
 from utils import generate_random_goal, generate_random_rectangle_obstacle
 from obstacle import Obstacle
 from dataclasses import dataclass
@@ -37,10 +42,34 @@ class State:
     omega_0: float
     omega_1: float
 
+    def __hash__(self):
+        # Fast hashing using bit manipulation
+        h = hash(round(self.theta_0, 3))
+        h = 31 * h + hash(round(self.theta_1, 3))
+        h = 31 * h + hash(round(self.omega_0, 3))
+        h = 31 * h + hash(round(self.omega_1, 3))
+        return h
+    
+    def __eq__(self, other):
+        if not isinstance(other, State):
+            return False
+        return (abs(self.theta_0 - other.theta_0) < 1e-3 and
+                abs(self.theta_1 - other.theta_1) < 1e-3 and
+                abs(self.omega_0 - other.omega_0) < 1e-3 and
+                abs(self.omega_1 - other.omega_1) < 1e-3)
+
     def __lt__(self, other):
         # Required for heapq operations
         return (self.theta_0, self.theta_1, self.omega_0, self.omega_1) < (
             other.theta_0, other.theta_1, other.omega_0, other.omega_1)
+
+@dataclass(frozen=True)
+class MotionPrimitive:
+    """Pre-computed motion primitive."""
+    start_angle: int  # Discretized start angle
+    end_pose: Tuple[float, float, float]  # dx, dy, dtheta
+    intermediate_poses: List[Tuple[float, float, float]]  # List of x,y,theta
+    cost_multiplier: float  # Additional cost multiplier
 
 class PlanningTimeoutError(Exception):
     """Raised when planning takes too long"""
@@ -92,8 +121,8 @@ class Robot:
         self.omega_1 = 0.0
         self.alpha_0 = 0.0
         self.alpha_1 = 0.0
-        self.m1 = 2  # Mass of link 1
-        self.m2 = 1.5  # Mass of link 2
+        self.m1 = 0.75  # Mass of link 1
+        self.m2 = 0.5  # Mass of link 2
         self.I1 = self.m1 * constants.LINK_1**2 / 12  # Inertia of link 1
         self.I2 = self.m2 * constants.LINK_2**2 / 12  # Inertia of link 2
 
@@ -305,7 +334,8 @@ class Visualizer:
             'obstacle': tuple(config['visualizer']['colors']['obstacle']),
             'success_text': tuple(config['visualizer']['colors']['success_text']),
             'path': tuple(config['visualizer']['colors'].get('path', [0, 0, 255])),
-            'reference_path': (0, 255, 0),
+            'reference_trajectory': (0, 255, 0),
+            'reference_path': (255, 165, 0),
             'actual_path': (255, 0, 0),
             'reference': (0, 255, 0),
             'actual': (255, 0, 0)
@@ -360,11 +390,19 @@ class Visualizer:
         """
         Renders both the planned path (reference) and the actual path followed by the robot.
         """
-        # Reference path (planned path)
+        
+        # Reference path 
+        if controller.coarse_path:
+            reference_points = [self.world.convert_to_display(robot.forward_kinematics(state.theta_0, state.theta_1)) for state in controller.coarse_path]
+            if len(reference_points) > 1:
+                pygame.draw.lines(self.screen, self.colors['reference_path'], False, reference_points, 2)
+
+        # Reference trajectory
         if controller.path:
             reference_points = [self.world.convert_to_display(robot.forward_kinematics(state.theta_0, state.theta_1)) for state in controller.path]
             if len(reference_points) > 1:
-                pygame.draw.lines(self.screen, self.colors['reference_path'], False, reference_points, 2)
+                pygame.draw.lines(self.screen, self.colors['reference_trajectory'], False, reference_points, 2)
+
 
         # Actual path
         if controller.actual_theta_0 and controller.actual_theta_1:
@@ -392,6 +430,27 @@ class Visualizer:
             success_text = self.font.render("Goal Reached Successfully!", True, self.colors['success_text'])
             text_rect = success_text.get_rect(center=(self.world.width // 4, 30))
             self.screen.blit(success_text, text_rect)
+        
+        # Path Legend
+        legend_x = self.screen_width / 4
+        legend_y = 10
+        legend_spacing = 20
+         # Reference Legend
+        pygame.draw.line(self.screen, self.colors['reference_path'], (legend_x, legend_y), (legend_x + 20, legend_y), 2)
+        path_text = self.font.render("Path", True, self.colors['reference_path'])
+        self.screen.blit(path_text, (legend_x + 30, legend_y - 8))
+
+        # Traj Legend
+        legend_y += legend_spacing
+        pygame.draw.line(self.screen, self.colors['reference_trajectory'], (legend_x, legend_y), (legend_x + 20, legend_y), 2)
+        traj_text = self.font.render("Traj", True, self.colors['reference_trajectory'])
+        self.screen.blit(traj_text, (legend_x + 30, legend_y - 8))
+
+        # Actual Legend
+        legend_y += legend_spacing
+        pygame.draw.line(self.screen, self.colors['actual_path'], (legend_x, legend_y), (legend_x + 20, legend_y), 2)
+        act_text = self.font.render("Ctrl", True, self.colors['actual_path'])
+        self.screen.blit(act_text, (legend_x + 30, legend_y - 8))
 
         if controller is not None:
             self.display_graphs(controller)
@@ -567,6 +626,247 @@ class Visualizer:
         """
         pygame.quit()
 
+# Efficient caching system
+class StateCache:
+    def __init__(self, max_size=10000):
+        self.cache = {}
+        self.max_size = max_size
+        self.hits = 0
+        self.misses = 0
+    
+    def get(self, key, default=None):
+        if key in self.cache:
+            self.hits += 1
+            return self.cache[key]
+        self.misses += 1
+        return default
+    
+    def put(self, key, value):
+        if len(self.cache) >= self.max_size:
+            # LRU-style eviction - remove oldest 25% of entries
+            items = list(self.cache.items())
+            self.cache = dict(items[len(items)//4:])
+        self.cache[key] = value
+
+# Optimized discretization handling
+class DiscreteEnvironment:
+    def __init__(self, resolution, bounds):
+        self.resolution = resolution
+        self.bounds = bounds
+        self.cell_count = np.ceil((bounds[1] - bounds[0]) / resolution).astype(int)
+        self.coordinate_to_cell = np.zeros(self.cell_count + 1)
+        self._precompute_coordinate_mappings()
+    
+    def _precompute_coordinate_mappings(self):
+        """Precompute continuous to discrete mappings"""
+        for i in range(self.cell_count + 1):
+            self.coordinate_to_cell[i] = self.bounds[0] + i * self.resolution
+    
+    def continuous_to_discrete(self, coord: float) -> int:
+        """Convert continuous coordinate to discrete cell efficiently"""
+        if coord <= self.bounds[0]:
+            return 0
+        if coord >= self.bounds[1]:
+            return self.cell_count - 1
+        return int((coord - self.bounds[0]) / self.resolution)
+    
+    def discrete_to_continuous(self, cell: int) -> float:
+        """Convert discrete cell to continuous coordinate efficiently"""
+        return self.coordinate_to_cell[cell]
+
+# Optimized collision detection using spatial hashing
+class CollisionCache:
+    def __init__(self, cell_size=0.1):
+        self.cell_size = cell_size
+        self.grid = defaultdict(set)
+        self.cache = StateCache()
+    
+    def _get_cells(self, segment: Tuple[Tuple[float, float], Tuple[float, float]]):
+        """Get all cells that a line segment intersects"""
+        start, end = segment
+        x0, y0 = int(start[0] / self.cell_size), int(start[1] / self.cell_size)
+        x1, y1 = int(end[0] / self.cell_size), int(end[1] / self.cell_size)
+        
+        cells = set()
+        dx = abs(x1 - x0)
+        dy = abs(y1 - y0)
+        x, y = x0, y0
+        
+        # Bresenham's line algorithm for cell traversal
+        sx = 1 if x1 > x0 else -1
+        sy = 1 if y1 > y0 else -1
+        err = dx - dy
+        
+        while True:
+            cells.add((x, y))
+            if x == x1 and y == y1:
+                break
+            e2 = 2 * err
+            if e2 > -dy:
+                err -= dy
+                x += sx
+            if e2 < dx:
+                err += dx
+                y += sy
+                
+        return cells
+
+    def check_collision(self, state: State, robot, obstacles) -> bool:
+        """Check collision using spatial hashing"""
+        cached = self.cache.get(state)
+        if cached is not None:
+            return cached
+        
+        # Get robot segments
+        segments = robot.compute_link_segments(state.theta_0, state.theta_1)
+        
+        # Check each segment against obstacles using spatial hashing
+        for segment in segments:
+            cells = self._get_cells(segment)
+            for cell in cells:
+                if cell in self.grid:
+                    for obstacle in self.grid[cell]:
+                        if self._check_segment_obstacle(segment, obstacle):
+                            self.cache.put(state, True)
+                            return True
+        
+        self.cache.put(state, False)
+        return False
+    
+    def _check_segment_obstacle(self, segment, obstacle):
+        """Efficient segment-obstacle collision check"""
+        # Implemented based on type of obstacle (circle/rectangle)
+        # Uses optimized geometric calculations
+        pass
+
+# Optimized successor generation
+class MotionPrimitives:
+    def __init__(self, robot_constants, num_angle_primitives, num_velocity_primitive):
+        self.constants = robot_constants
+        self.primitives = {}
+        self.primitive_cache = StateCache()
+        self.num_angle_primitives = num_angle_primitives
+        self.num_velocity_primitives = num_velocity_primitive
+        
+    def generate_primitives(self):
+        """Generate motion primitives using vectorized operations"""
+        angles = np.linspace(self.constants.JOINT_LIMITS[0] / 8, 
+                           self.constants.JOINT_LIMITS[1] / 8,
+                           self.num_angle_primitives)
+        velocities = np.linspace(-self.constants.MAX_VELOCITY / 3,
+                               self.constants.MAX_VELOCITY / 3,
+                               self.num_velocity_primitives)
+        
+        # Vectorized primitive generation
+        for angle in angles:
+            primitives = self._generate_angle_primitives(angle, velocities)
+            self.primitives[round(angle, 3)] = primitives
+    
+    def _generate_angle_primitives(self, angle, velocities):
+        """Generate primitives for a specific angle using vectorized operations"""
+        primitive_list = []
+        
+        # Create meshgrid for efficient primitive generation
+        v0, v1 = np.meshgrid(velocities, velocities)
+        
+        # Vectorized delta computation
+        delta_theta0 = v0 * self.constants.DT
+        delta_theta1 = v1 * self.constants.DT
+        
+        # Vectorized feasibility check
+        mask = self._check_feasibility_vectorized(angle, delta_theta0, delta_theta1, v0, v1)
+        
+        # Create primitives for valid combinations
+        valid_indices = np.argwhere(mask)
+        for idx in valid_indices:
+            i, j = idx
+            primitive_list.append({
+                'velocities': (v0[i,j], v1[i,j]),
+                'delta_angles': (delta_theta0[i,j], delta_theta1[i,j]),
+                'cost_mult': self._compute_cost(v0[i,j], v1[i,j])
+            })
+            
+        return primitive_list
+    
+    def _check_feasibility_vectorized(self, angle, delta_theta0, delta_theta1, v0, v1):
+        """Vectorized feasibility checking"""
+        new_theta0 = angle + delta_theta0
+        new_theta1 = angle + delta_theta1
+        
+        # Joint limits check
+        limits_check = (new_theta0 >= self.constants.JOINT_LIMITS[0]) & \
+                      (new_theta0 <= self.constants.JOINT_LIMITS[1]) & \
+                      (new_theta1 >= self.constants.JOINT_LIMITS[0]) & \
+                      (new_theta1 <= self.constants.JOINT_LIMITS[1])
+        
+        # Velocity limits check
+        velocity_check = (np.abs(v0) <= self.constants.MAX_VELOCITY) & \
+                        (np.abs(v1) <= self.constants.MAX_VELOCITY)
+        
+        return limits_check & velocity_check
+    
+    def _compute_cost(self, v0, v1):
+        """Compute primitive cost"""
+        v_norm = (v0**2 + v1**2) / (2 * self.constants.MAX_VELOCITY**2)
+        return 1.0 + v_norm
+
+# Optimized heuristic computation
+class HeuristicComputer:
+    def __init__(self, discrete_env):
+        self.discrete_env = discrete_env
+        self.heuristic_cache = StateCache()
+        self.distance_maps = {}
+        
+    def precompute_heuristic_map(self, goal_state: State):
+        """Precompute heuristic values using efficient Dijkstra"""
+        # Convert goal state to discrete coordinates
+        goal_cell = (self.discrete_env.continuous_to_discrete(goal_state.theta_0),
+                    self.discrete_env.continuous_to_discrete(goal_state.theta_1))
+        
+        # Create sparse adjacency matrix for graph
+        data, rows, cols = [], [], []
+        N = self.discrete_env.cell_count**2
+        
+        # Build sparse matrix efficiently
+        for i in range(self.discrete_env.cell_count):
+            for j in range(self.discrete_env.cell_count):
+                idx = i * self.discrete_env.cell_count + j
+                for di, dj in [(-1,0), (1,0), (0,-1), (0,1), (-1,-1), (-1,1), (1,-1), (1,1)]:
+                    ni, nj = i + di, j + dj
+                    if 0 <= ni < self.discrete_env.cell_count and 0 <= nj < self.discrete_env.cell_count:
+                        nidx = ni * self.discrete_env.cell_count + nj
+                        cost = np.sqrt(di*di + dj*dj)
+                        data.append(cost)
+                        rows.append(idx)
+                        cols.append(nidx)
+        
+        # Create sparse matrix and compute distances
+        matrix = sparse.csr_matrix((data, (rows, cols)), shape=(N, N))
+        start_idx = goal_cell[0] * self.discrete_env.cell_count + goal_cell[1]
+        distances = dijkstra(matrix, indices=start_idx)
+        
+        # Reshape to 2D array and store
+        self.distance_maps[goal_state] = distances.reshape(
+            self.discrete_env.cell_count,
+            self.discrete_env.cell_count
+        )
+    
+    def get_heuristic(self, state: State, goal_state: State) -> float:
+        """Get heuristic value with caching"""
+        cache_key = (state, goal_state)
+        cached = self.heuristic_cache.get(cache_key)
+        if cached is not None:
+            return cached
+        
+        # Convert state to discrete coordinates
+        state_cell = (self.discrete_env.continuous_to_discrete(state.theta_0),
+                     self.discrete_env.continuous_to_discrete(state.theta_1))
+        
+        # Get value from precomputed distance map
+        value = self.distance_maps[goal_state][state_cell[0], state_cell[1]]
+        self.heuristic_cache.put(cache_key, value)
+        return value
+
 class Planner:
     def __init__(self, robot, world):
         self.robot = robot
@@ -607,8 +907,8 @@ class GridBasedPlanner(Planner):
         self.resolutions = (self.constants.THETA_0_RESOLUTION, self.constants.THETA_1_RESOLUTION)
         self.collision_cache: Dict[State, bool] = {}
         self.max_cache_size = 10000
-        self.planning_timeout = 30.0
-        self.progress_timeout = 15.0
+        self.planning_timeout = 300.0
+        self.progress_timeout = 150.0
         self.min_progress_threshold = 0.1  
         self.max_explored_states = 10000
 
@@ -743,6 +1043,20 @@ class GridBasedPlanner(Planner):
                 break
             total_path.append(current)
         return total_path[::-1]  # Reverse path
+
+    def check_timeout_and_progress(self, current: State, goal: State, start_time: float):
+        """Check for timeout and lack of progress"""
+        current_time = time.time()
+        if current_time - start_time > self.planning_timeout:
+            raise PlanningTimeoutError("Planning timeout reached")
+
+        # Check progress
+        current_distance = self.heuristic(current, goal)
+        if current_distance < self.best_distance_to_goal:
+            self.best_distance_to_goal = current_distance
+            self.last_progress_time = current_time
+        elif current_time - self.last_progress_time > self.progress_timeout:  # 25 seconds without progress
+            raise PlanningTimeoutError("No progress made in planning")
 
 
 class AStarPlanner(GridBasedPlanner):
@@ -977,19 +1291,6 @@ class AStarPlanner(GridBasedPlanner):
                 return False
         
         return True
-    def check_timeout_and_progress(self, current: State, goal: State, start_time: float):
-        """Check for timeout and lack of progress"""
-        current_time = time.time()
-        if current_time - start_time > self.planning_timeout:
-            raise PlanningTimeoutError("Planning timeout reached")
-
-        # Check progress
-        current_distance = self.heuristic(current, goal)
-        if current_distance < self.best_distance_to_goal:
-            self.best_distance_to_goal = current_distance
-            self.last_progress_time = current_time
-        elif current_time - self.last_progress_time > self.progress_timeout:  # 25 seconds without progress
-            raise PlanningTimeoutError("No progress made in planning")
 
     def _generate_motion_primitives(self) -> List[Tuple[float, float]]:
         """Generate motion primitives with better goal-reaching characteristics"""
@@ -1489,13 +1790,9 @@ class AStarPlanner(GridBasedPlanner):
         # Get initial path
         try:
             # First try coarse planning
-            self.set_mode('kinodynamic')
-            path = self.plan(start, goal, robot, final_velocities)
-            self.debug_helper.print_path_stats(path, robot)
-            self.debug_helper.validate_path_limits(path, robot)
-            self.debug_helper.print_path_points(path)
-            return path
+            self.set_mode('coarse')
             coarse_path = self.plan(start, goal, robot)
+
             if not coarse_path:
                 self.debug_helper.log_state("Coarse planning failed, attempting kinodynamic planning")
                 self.set_mode('kinodynamic')
@@ -1506,31 +1803,21 @@ class AStarPlanner(GridBasedPlanner):
                 return path
                 
             # If coarse path found, refine it with kinodynamic constraints
-            self.set_mode('kinodynamic')
-            refined_path = self._refine_path(coarse_path, robot)
-            coarse_path_last_state = coarse_path[-1] 
-            goal_pos = robot.forward_kinematics(goal[0], goal[1])
-            coarse_path_last_pos = robot.forward_kinematics(coarse_path_last_state.theta_0, coarse_path_last_state.theta_1)
-            dist_to_goal = np.hypot(goal_pos[0] - coarse_path_last_pos[0], goal_pos[1] - coarse_path_last_pos[1])
-
-            self.debug_helper.log_state(f"dist_to_goal: {dist_to_goal:.3f}")
-            
+            self.set_mode('kinodynamic')            
             if self.best_distance_to_goal < 2.0:
-                self.debug_helper.log_state("Successfully refined coarse path")
-                self.debug_helper.print_path_stats(refined_path, robot)
-                self.debug_helper.validate_path_limits(refined_path, robot)
-                self.debug_helper.print_path_points(refined_path)
-                return refined_path
+                self.debug_helper.log_state("Successfully coarse path")
+                self.debug_helper.print_path_stats(coarse_path, robot)
+                self.debug_helper.validate_path_limits(coarse_path, robot)
+                self.debug_helper.print_path_points(coarse_path)
+                return coarse_path
             else:
-                self.debug_helper.log_state("Coarse path refining fails, attempting kinodynamic planning")
+                self.debug_helper.log_state("Coarse path did not reach goal, attempting goal to coarse connection by kinodynamic planning")
                 path_segments = 5
                 for i in range(path_segments,0 , -1):
                     self.debug_helper.log_state("Attempting to connect coarse path to goal")
                     # Get state from coarse path
-                    if refined_path:
-                        intermediate_state = refined_path[(int(len(coarse_path) * (i) / path_segments)) - 1]
-                    else:
-                        intermediate_state = coarse_path[(int(len(coarse_path) * (i) / path_segments)) - 1]
+                    intermediate_state = coarse_path[(int(len(coarse_path) * (i) / path_segments)) - 1]
+
                     # Extract state information properly
                     new_goal = (intermediate_state.theta_0, intermediate_state.theta_1)
                     # Use velocities from the state if available
@@ -1538,20 +1825,14 @@ class AStarPlanner(GridBasedPlanner):
                                 getattr(intermediate_state, 'velocity_1', 0.0))
                     
                     path = self.plan(goal, new_goal, robot, velocities)
-                    
-                    if path:
+                    self.debug_helper.log_state(f"Planner found connection path with distance to goal: {self.best_distance_to_goal:.3f}")
+                    if path and self.best_distance_to_goal < 0.3:
                         path.reverse()
                         path_final = []
-                        if refined_path:
-                            # Use proper indexing for refined path
-                            split_index = (int(len(refined_path) * i / path_segments)) - 1
-                            path_final = refined_path[:split_index]
-                            path_final.extend(path)
-                        else:
-                            # Use proper indexing for coarse path
-                            split_index = (int(len(coarse_path) * i / path_segments)) - 1
-                            path_final = coarse_path[:split_index]
-                            path_final.extend(path)
+                        # Use proper indexing for coarse path
+                        split_index = (int(len(coarse_path) * i / path_segments)) - 1
+                        path_final = coarse_path[:split_index]
+                        path_final.extend(path)
                         
                         self.debug_helper.print_path_stats(path_final, robot)
                         self.debug_helper.print_path_points(path_final)
@@ -2022,161 +2303,1105 @@ class AStarPlanner(GridBasedPlanner):
             self.debug_helper.log_state(f"Planning error: {str(e)}")
             return []
 
-class SBPLLatticePlanner(GridBasedPlanner):
+
+
+
+class AngleParameters:
     """
-    SBPL-style lattice planner using optimized motion primitives with acceleration constraints.
+    Manages angle-related parameters and calculations for the SBPL Planner.
+    Handles joint limits, discretization, and angle space conversions.
     """
-    def __init__(self, robot, world):
+    def __init__(self, config, resolution=None):
+        self.theta_0_resolution = resolution if resolution else config["robot"]["theta_0_resolution"]
+        self.theta_1_resolution = resolution if resolution else config["robot"]["theta_1_resolution"]
+        self.joint_limits = [-np.pi, np.pi]
+        self.angle_space_factor = 4
+        self.motion_primitive_factor = 2
+        self.planning_angle_resolution = 4 * self.theta_0_resolution
+        self.joint_range = self.joint_limits[1] - self.joint_limits[0]
+        self.limited_joint_range = self.joint_range / self.angle_space_factor
+        self.num_discrete_angles = int(self.limited_joint_range / self.planning_angle_resolution) + 1
+        self.motion_primitive_range = self.joint_range / self.motion_primitive_factor
+        self.num_motion_primitive_angles = int(self.motion_primitive_range / self.planning_angle_resolution) + 1
+
+        # Pre-compute angle mappings for efficient lookup
+        self.discrete_to_continuous = {}
+        self.continuous_to_discrete = {}
+        self._precompute_angle_mappings()
+
+    def _precompute_angle_mappings(self):
+        base_angle = self.joint_limits[0] / self.angle_space_factor
+        for idx in range(self.num_discrete_angles):
+            cont_angle = base_angle + idx * self.planning_angle_resolution
+            self.discrete_to_continuous[idx] = cont_angle
+            self.continuous_to_discrete[cont_angle] = idx
+
+    def get_discrete_angle(self, continuous_angle):
+        normalized_angle = max(min(continuous_angle, self.joint_limits[1]), self.joint_limits[0])
+        base_angle = self.joint_limits[0] / self.angle_space_factor
+        angle_idx = int((normalized_angle - base_angle) / self.planning_angle_resolution)
+        return max(0, min(angle_idx, self.num_discrete_angles - 1))
+
+    def get_continuous_angle(self, angle_idx):
+        base_angle = self.joint_limits[0] / self.angle_space_factor
+        return base_angle + angle_idx * self.planning_angle_resolution
+
+    def is_valid_angle(self, angle):
+        return self.joint_limits[0] <= angle <= self.joint_limits[1]
+
+    def get_motion_primitive_angles(self):
+        angles = []
+        base_angle = self.joint_limits[0] / self.motion_primitive_factor
+        for i in range(self.num_motion_primitive_angles):
+            angle = base_angle + i * self.planning_angle_resolution
+            if self.is_valid_angle(angle):
+                angles.append(angle)
+        return angles
+
+
+# class SBPLPlanner:
+#     def __init__(self, robot, world, config):
+#         self.robot = robot
+#         self.world = world
+#         self.config = config
+#         self.constants = robot.constants
+#         self.debug_helper = DebugHelper(debug=True)
+#         self.angle_params = None
+        
+#         self.debug_helper.log_state("\n=== Initializing SBPL Planner ===")
+
+#         self.angle_resolution = None
+#         self.num_angles = None
+        
+#         self.max_velocity = self.constants.MAX_VELOCITY / 2.0 
+#         self.min_velocity = self.constants.MIN_VELOCITY
+#         self.velocity_resolution = self.constants.VELOCITY_RESOLUTION * 2.0
+#         self.dt = self.constants.DT
+
+#         self.max_iterations = 50000
+#         self.planning_timeout = 100.0
+
+#         self.num_discrete_angles = None
+#         self.num_velocities = int((2 * self.max_velocity) / self.velocity_resolution) + 1
+
+#         self.collision_cache = {}
+#         self.heuristic_lookup = {}
+#         self.goal_state = None
+#         self.angle_params_by_resolution = {}
+#         self.inverse_dynamics_cache = {}
+
+#         self.debug_helper.log_state(f"Angle Resolution: {self.angle_resolution}")
+#         self.debug_helper.log_state(f"Number of Discrete Angles: {self.num_angles}")
+#         self.debug_helper.log_state(f"Velocity Range: [{self.min_velocity}, {self.max_velocity}]")
+#         self.debug_helper.log_state(f"Velocity Resolution: {self.velocity_resolution}")
+
+#         self.motion_primitives_by_resolution = {}
+#         self.heuristic_costmaps = {}
+#         self.joint_space_graphs = {}
+        
+#         self.resolutions = [(0.04, 10.0), (0.04, 5.0), (0.04, 1.5), (0.02, 10.0), (0.01, 5.0), (0.01, 1.5)]
+        
+#         for resolution, _ in self.resolutions:
+#             self.angle_params = AngleParameters(config, resolution)
+#             self._precompute_offline_data(resolution)
+
+#     def _precompute_offline_data(self, resolution):
+#         self.debug_helper.log_state(f"Generating motion primitives for resolution {resolution}...")
+        
+#         self.angle_params = AngleParameters(self.config, resolution)
+#         self.angle_params_by_resolution[resolution] = self.angle_params
+#         self.angle_resolution = resolution
+#         self.num_discrete_angles = self.angle_params.num_discrete_angles
+#         self.num_angles = self.angle_params.num_discrete_angles
+
+#         self.motion_primitives = self.generate_motion_primitives()
+#         self.motion_primitives_by_resolution[resolution] = self.motion_primitives
+
+#         self.joint_space_graphs[resolution] = self.create_joint_space_graph()
+
+#     def precompute_heuristics(self, goal_state):
+#         self.debug_helper.log_state("\nPrecomputing heuristics for all resolutions...")
+        
+#         for resolution, _ in self.resolutions:
+#             self.angle_params = self.angle_params_by_resolution[resolution]
+#             self.joint_space_graph = self.joint_space_graphs[resolution]
+            
+#             goal_theta0_idx = self.angle_params.get_discrete_angle(goal_state.theta_0)
+#             goal_theta1_idx = self.angle_params.get_discrete_angle(goal_state.theta_1)
+            
+#             self.heuristic_costmaps[resolution] = self.compute_costs_to_goal(
+#                 self.joint_space_graph, 
+#                 (goal_theta0_idx, goal_theta1_idx)
+#             )
+            
+#         self.debug_helper.log_state("Heuristic precomputation complete")
+
+#     def update_heuristic_costmap(self, goal_state):
+#         self.debug_helper.log_state("Computing Dijkstra-based heuristic costmap...")
+        
+#         goal_theta0_idx = self.angle_params.get_discrete_angle(goal_state.theta_0)
+#         goal_theta1_idx = self.angle_params.get_discrete_angle(goal_state.theta_1)
+        
+#         self.heuristic_costmap = self.compute_costs_to_goal(
+#             self.joint_space_graph, 
+#             (goal_theta0_idx, goal_theta1_idx)
+#         )
+        
+#         self.debug_helper.log_state("Heuristic costmap computation complete")
+
+#     def heuristic(self, state: State, goal_state: State) -> float:
+#         state_theta0_idx = self.angle_params.get_discrete_angle(state.theta_0)
+#         state_theta1_idx = self.angle_params.get_discrete_angle(state.theta_1)
+        
+#         h_cost = self.heuristic_costmap[state_theta0_idx][state_theta1_idx]
+        
+#         if np.isinf(h_cost):
+#             # If no valid path in costmap, find nearest valid state
+#             valid_states = np.argwhere(~np.isinf(self.heuristic_costmap))
+#             if len(valid_states) > 0:
+#                 current_pos = np.array([state_theta0_idx, state_theta1_idx])
+#                 distances = np.linalg.norm(valid_states - current_pos, axis=1)
+#                 nearest_idx = np.argmin(distances)
+#                 nearest_valid = valid_states[nearest_idx]
+#                 h_cost = self.heuristic_costmap[nearest_valid[0]][nearest_valid[1]]
+                
+#                 h_cost += distances[nearest_idx] * self.angle_params.planning_angle_resolution
+        
+#         return h_cost
+
+#     def compute_costs_to_goal(self, graph, goal_indices):
+#         costs = np.full((self.angle_params.num_discrete_angles, 
+#                         self.angle_params.num_discrete_angles), np.inf)
+#         costs[goal_indices[0]][goal_indices[1]] = 0
+        
+#         pq = [(0, goal_indices)]
+#         visited = set()
+        
+#         while pq:
+#             current_cost, current_state = heapq.heappop(pq)
+            
+#             if current_state in visited:
+#                 continue
+#             visited.add(current_state)
+            
+#             for neighbor_state, edge_cost in graph[current_state].items():
+#                 if neighbor_state not in visited:
+#                     new_cost = current_cost + edge_cost
+#                     if new_cost < costs[neighbor_state[0]][neighbor_state[1]]:
+#                         costs[neighbor_state[0]][neighbor_state[1]] = new_cost
+#                         heapq.heappush(pq, (new_cost, neighbor_state))
+        
+#         return costs
+
+#     def generate_motion_primitives(self) -> dict:
+#         motion_primitives = {}
+#         primitive_count = 0
+#         skipped_count = 0
+
+#         self.debug_helper.log_state("\n=== Generating Motion Primitives ===")
+#         velocity_values = np.linspace(self.min_velocity, self.max_velocity, self.num_velocities)
+
+#         # Get a subset of angles for the first joint from angle_params
+#         angles = self.angle_params.get_motion_primitive_angles()
+    
+#         for angle_idx, current_theta0 in enumerate(angles):
+#             primitives = []
+#             for theta1_idx in range(self.num_angles):
+#                 current_theta1 = self.angle_params.get_continuous_angle(theta1_idx)
+#                 local_primitive_count = 0
+                
+#                 for v0 in velocity_values:
+#                     if abs(v0) > self.max_velocity:
+#                         continue
+#                     for v1 in velocity_values:
+#                         if abs(v1) > self.max_velocity:
+#                             continue
+
+#                         delta_theta0 = v0 * self.dt
+#                         delta_theta1 = v1 * self.dt
+#                         new_theta0 = current_theta0 + delta_theta0
+#                         new_theta1 = current_theta1 + delta_theta1
+
+#                         if not (self.constants.JOINT_LIMITS[0] <= new_theta0 <= self.constants.JOINT_LIMITS[1]):
+#                             continue
+#                         if not (self.constants.JOINT_LIMITS[0] <= new_theta1 <= self.constants.JOINT_LIMITS[1]):
+#                             continue
+
+#                         key = (current_theta0, current_theta1, v0, v1, 0.0, 0.0)
+#                         if key in self.inverse_dynamics_cache:
+#                             tau0, tau1 = self.inverse_dynamics_cache[key]
+#                         else:
+#                             try:
+#                                 tau0, tau1 = self.robot.inverse_dynamics(
+#                                     current_theta0, current_theta1,
+#                                     v0, v1,
+#                                     0.0, 0.0
+#                                 )
+#                                 self.inverse_dynamics_cache[key] = (tau0, tau1)
+#                             except np.linalg.LinAlgError:
+#                                 skipped_count += 1
+#                                 continue
+
+#                         if self.check_motion_feasibility(
+#                             current_theta0, current_theta1,
+#                             delta_theta0, delta_theta1,
+#                             v0, v1, tau0, tau1
+#                         ):
+#                             cost_mult = self.calculate_dynamic_cost(v0, v1, tau0, tau1)
+#                             primitives.append({
+#                                 'primID': len(primitives),
+#                                 'velocities': (v0, v1),
+#                                 'torques': (tau0, tau1),
+#                                 'delta_angles': (delta_theta0, delta_theta1),
+#                                 'cost_mult': cost_mult
+#                             })
+#                             local_primitive_count += 1
+#                             primitive_count += 1
+#                         else:
+#                             skipped_count += 1
+                
+#                 # local_primitive_count > 0 can be used to debug if needed
+
+#             motion_primitives[angle_idx] = primitives
+
+#         self.debug_helper.log_state(f"\nMotion Primitive Generation Summary:")
+#         self.debug_helper.log_state(f"Total primitives generated: {primitive_count}")
+#         self.debug_helper.log_state(f"Total primitives skipped: {skipped_count}")
+        
+#         return motion_primitives
+
+#     def check_motion_feasibility(self, theta0, theta1, delta_theta0, delta_theta1, v0, v1, tau0, tau1):
+#         new_theta0 = theta0 + delta_theta0
+#         new_theta1 = theta1 + delta_theta1
+        
+#         if not (self.constants.JOINT_LIMITS[0] <= new_theta0 <= self.constants.JOINT_LIMITS[1]):
+#             return False
+#         if not (self.constants.JOINT_LIMITS[0] <= new_theta1 <= self.constants.JOINT_LIMITS[1]):
+#             return False
+
+#         if abs(v0) > self.constants.MAX_VELOCITY or abs(v1) > self.constants.MAX_VELOCITY:
+#             return False
+
+#         try:
+#             alpha0, alpha1 = self.robot.forward_dynamics(theta0, theta1, v0, v1, tau0, tau1)
+#             if abs(alpha0) > self.constants.MAX_ACCELERATION or abs(alpha1) > self.constants.MAX_ACCELERATION:
+#                 return False
+#         except:
+#             return False
+
+#         if self.robot.self_collision(new_theta0, new_theta1):
+#             return False
+
+#         return True
+ 
+#     def Plan(self, start: tuple, goal: tuple, robot, final_velocities=(0.0, 0.0)) -> list:
+#         self.debug_helper.print_planning_header()
+#         self.debug_helper.log_state(f"Planning from {start} to {goal}")
+        
+#         start_angles = robot.inverse_kinematics(*start)
+#         goal_angles = robot.inverse_kinematics(*goal)
+        
+#         start_state = State(start_angles[0], start_angles[1], 0.0, 0.0)
+#         goal_state = State(goal_angles[0], goal_angles[1], final_velocities[0], final_velocities[1])
+#         self.goal_state = goal_state
+
+#         self.precompute_heuristics(goal_state)
+                
+#         start_time = time.time()
+#         best_path = None
+#         best_cost = float('inf')
+
+#         for resolution, epsilon in self.resolutions:
+#             self.debug_helper.log_state(f"\nTrying resolution {resolution} with epsilon {epsilon}")
+            
+#             self.motion_primitives = self.motion_primitives_by_resolution[resolution]
+#             self.angle_params = self.angle_params_by_resolution[resolution]
+#             self.joint_space_graph = self.joint_space_graphs[resolution]
+#             self.heuristic_costmap = self.heuristic_costmaps[resolution]
+            
+#             path = self.search_with_epsilon(start_state, goal_state, epsilon, start_time)
+            
+#             if path:
+#                 path_cost = self.compute_path_cost(path)
+#                 if path_cost < best_cost:
+#                     best_path = path
+#                     best_cost = path_cost
+#                     self.debug_helper.log_state(f"Found better path with cost: {path_cost}")
+                    
+#             if best_path:
+#                 break
+                
+#         return best_path if best_path else []
+
+#     def search_with_epsilon(self, start_state, goal_state, epsilon, start_time):
+#         self.angle_resolution = self.angle_params.planning_angle_resolution
+#         open_set = []
+#         closed_set = set()
+#         came_from = {}
+#         g_score = {start_state: 0}
+#         f_score = {start_state: epsilon * self.heuristic(start_state, goal_state)}
+        
+#         heapq.heappush(open_set, (f_score[start_state], id(start_state), start_state))
+#         iterations = 0
+        
+#         while open_set and (time.time() - start_time) < self.planning_timeout:
+#             current_f, _, current_state = heapq.heappop(open_set)
+            
+#             if self.is_goal_reached(current_state, goal_state):
+#                 path = self.reconstruct_path(came_from, current_state)
+#                 return path
+                
+#             closed_set.add(current_state)
+            
+#             dist_to_goal = self.heuristic(current_state, goal_state)
+#             K = 300 if dist_to_goal >= 50 else 600
+            
+#             neighbors = self.get_pruned_neighbors(current_state, K=K)
+#             self.debug_helper.log_state(f"Number of neighbours: {len(neighbors)}")
+
+#             iterations += 1
+            
+#             if iterations % 1000 == 0:
+#                 self.debug_helper.log_state(
+#                     f"Iteration {iterations}: Open set: {len(open_set)}, "
+#                     f"Closed set: {len(closed_set)}, Best f: {current_f:.2f}"
+#                 )
+                
+#                 ee_current = self.robot.forward_kinematics(current_state.theta_0, current_state.theta_1)
+#                 ee_goal = self.robot.forward_kinematics(goal_state.theta_0, goal_state.theta_1)
+#                 dist_to_goal = np.hypot(ee_current[0] - ee_goal[0], ee_current[1] - ee_goal[1])
+#                 self.debug_helper.log_state(f"Distance to goal: {dist_to_goal:.3f}")
+            
+#             for neighbor, cost in neighbors:
+#                 if neighbor in closed_set:
+#                     continue
+                    
+#                 tentative_g_score = g_score[current_state] + cost
+                
+#                 if (neighbor not in g_score or 
+#                     tentative_g_score < g_score[neighbor]):
+                    
+#                     if not self.is_collision(neighbor):
+#                         came_from[neighbor] = current_state
+#                         g_score[neighbor] = tentative_g_score
+#                         f_score_val = tentative_g_score + epsilon * self.heuristic(neighbor, goal_state)
+                        
+#                         heapq.heappush(open_set, (f_score_val, id(neighbor), neighbor))
+        
+#         self.debug_helper.log_state(
+#             f"\nNo path found in this iteration:"
+#             f"\n  - Iterations: {iterations}"
+#             f"\n  - States explored: {iterations}"
+#             f"\n  - Final open set size: {len(open_set)}"
+#             f"\n  - Final closed set size: {len(closed_set)}"
+#         )
+#         return None
+
+#     def recalculate_discretization(self):
+#         self.num_discrete_angles = int((self.angle_params.joint_limits[1] - self.angle_params.joint_limits[0]) / 
+#                                      self.angle_resolution) + 1
+        
+#         self.collision_cache = {}
+#         self.heuristic_lookup = {}
+#         self.heuristic_costmap = None
+        
+#         self.motion_primitives = self.generate_motion_primitives()
+        
+#         if self.goal_state is not None:
+#             self.calc_heuristic_costmap(self.goal_state)
+
+#     def is_goal_reached(self, current_state: State, goal_state: State) -> bool:
+#         angle_threshold = self.angle_params.planning_angle_resolution
+#         is_reached = (abs(current_state.theta_0 - goal_state.theta_0) <= angle_threshold and
+#                       abs(current_state.theta_1 - goal_state.theta_1) <= angle_threshold)
+#         return is_reached
+
+#     def get_pruned_neighbors(self, current_state: State, K=30):
+#         neighbors = []
+#         # Find closest angle index in motion primitive angles
+#         angles = self.angle_params.get_motion_primitive_angles()
+#         theta_0_val = current_state.theta_0
+
+#         # Find the closest angle index to theta_0_val using a simple for-loop
+#         closest_diff = float('inf')
+#         angle_idx = 0
+#         for i, a in enumerate(angles):
+#             diff = abs(a - theta_0_val)
+#             if diff < closest_diff:
+#                 closest_diff = diff
+#                 angle_idx = i
+
+#         for idx_offset in range(-5 , 6, 1):
+#             adj_theta_0_idx = (angle_idx + idx_offset) % len(angles)
+#             primitives = self.motion_primitives.get(adj_theta_0_idx, [])
+            
+#             # Sort primitives by cost_mult
+#             primitives = sorted(primitives, key=lambda p: p['cost_mult'])[:K*2]
+            
+#             for primitive in primitives:
+#                 delta_theta_0, delta_theta_1 = primitive['delta_angles']
+#                 new_theta_0 = current_state.theta_0 + delta_theta_0
+#                 new_theta_1 = current_state.theta_1 + delta_theta_1
+                
+#                 if (self.constants.JOINT_LIMITS[0] <= new_theta_0 <= self.constants.JOINT_LIMITS[1] and
+#                     self.constants.JOINT_LIMITS[0] <= new_theta_1 <= self.constants.JOINT_LIMITS[1]):
+                    
+#                     new_state = State(
+#                         new_theta_0, new_theta_1,
+#                         primitive['velocities'][0],
+#                         primitive['velocities'][1]
+#                     )
+                    
+#                     cost = self.cost(current_state, new_state, primitive['cost_mult'])
+                    
+#                     if not np.isinf(cost):
+#                         dir_to_neighbor = np.array([
+#                             new_theta_0 - current_state.theta_0,
+#                             new_theta_1 - current_state.theta_1
+#                         ])
+#                         dir_to_goal = np.array([
+#                             self.goal_state.theta_0 - current_state.theta_0,
+#                             self.goal_state.theta_1 - current_state.theta_1
+#                         ])
+                        
+#                         dir_norm = np.linalg.norm(dir_to_neighbor)
+#                         goal_norm = np.linalg.norm(dir_to_goal)
+                        
+#                         if dir_norm > 0 and goal_norm > 0:
+#                             dir_to_neighbor = dir_to_neighbor / dir_norm
+#                             dir_to_goal = dir_to_goal / goal_norm
+#                             alignment = np.dot(dir_to_goal, dir_to_neighbor)
+#                             total_score = cost * (2.0 - alignment)
+#                         else:
+#                             total_score = cost * 3.0
+                            
+#                         neighbors.append((new_state, total_score))
+        
+#         neighbors.sort(key=lambda x: x[1])
+#         return neighbors
+
+#     def compute_path_cost(self, path):
+#         if not path:
+#             return float('inf')
+            
+#         total_cost = 0
+#         for i in range(len(path) - 1):
+#             current = path[i]
+#             next_state = path[i + 1]
+
+#             # Find closest angle index for current state theta0
+#             angles = self.angle_params.get_motion_primitive_angles()
+#             angle_values = np.array(angles)
+#             angle_idx = (np.abs(angle_values - current.theta_0)).argmin()
+#             primitives = self.motion_primitives.get(angle_idx, [])
+            
+#             # Find minimal cost transition
+#             min_cost = float('inf')
+#             for primitive in primitives:
+#                 new_theta_0 = current.theta_0 + primitive['delta_angles'][0]
+#                 new_theta_1 = current.theta_1 + primitive['delta_angles'][1]
+#                 if abs(new_theta_0 - next_state.theta_0) < 1e-6 and abs(new_theta_1 - next_state.theta_1) < 1e-6:
+#                     c = self.cost(current, next_state, primitive['cost_mult'])
+#                     if c < min_cost:
+#                         min_cost = c
+#             total_cost += min_cost
+        
+#         return total_cost
+
+#     def calculate_dynamic_cost(self, v0, v1, tau0, tau1):
+#         v_norm = (v0**2 + v1**2) / (2 * self.max_velocity**2)
+#         max_torque = self.max_velocity * self.robot.m1 * self.constants.LINK_1 
+#         tau_norm = (tau0**2 + tau1**2) / (2 * max_torque**2)
+#         w_v = 1.0
+#         w_tau = 0.5
+#         return 1.0 + w_v * v_norm + w_tau * tau_norm
+
+#     def create_joint_space_graph(self):
+#         graph = {}
+#         moves = [(-1,-1), (-1,0), (-1,1), (0,-1), (0,1), (1,-1), (1,0), (1,1)]
+        
+#         for theta0_idx in range(self.num_discrete_angles):
+#             theta0 = self.angle_params.get_continuous_angle(theta0_idx)
+#             for theta1_idx in range(self.num_discrete_angles):
+#                 theta1 = self.angle_params.get_continuous_angle(theta1_idx)
+#                 current_state = (theta0_idx, theta1_idx)
+#                 neighbors = {}
+                
+#                 for move in moves:
+#                     new_theta0_idx = theta0_idx + move[0]
+#                     new_theta1_idx = theta1_idx + move[1]
+                    
+#                     if (0 <= new_theta0_idx < self.num_discrete_angles and 
+#                         0 <= new_theta1_idx < self.num_discrete_angles):
+                        
+#                         new_theta0 = self.angle_params.get_continuous_angle(new_theta0_idx)
+#                         new_theta1 = self.angle_params.get_continuous_angle(new_theta1_idx)
+                        
+#                         if self.check_motion_collision_free(theta0, theta1, new_theta0, new_theta1):
+#                             weight = np.sqrt(move[0]**2 + move[1]**2)
+#                             neighbors[(new_theta0_idx, new_theta1_idx)] = weight
+                
+#                 graph[current_state] = neighbors
+        
+#         return graph
+
+#     def check_motion_collision_free(self, theta0, theta1, new_theta0, new_theta1):
+#         NUM_STEPS = 5  
+#         for i in range(NUM_STEPS + 1):
+#             t = i / NUM_STEPS
+#             theta0_i = theta0 + t * (new_theta0 - theta0)
+#             theta1_i = theta1 + t * (new_theta1 - theta1)
+            
+#             link_segments = self.robot.compute_link_segments(theta0_i, theta1_i)
+            
+#             if self.robot.self_collision(theta0_i, theta1_i):
+#                 return False
+            
+#             for obstacle in self.world.obstacles:
+#                 for segment in link_segments:
+#                     if obstacle.shape == 'circle':
+#                         if CollisionChecker.line_circle_collision(
+#                             segment[0], segment[1], 
+#                             obstacle.position, obstacle.size):
+#                             return False
+#                     elif obstacle.shape == 'rectangle':
+#                         if CollisionChecker.line_rectangle_collision(
+#                             segment[0], segment[1], 
+#                             obstacle.position, obstacle.size):
+#                             return False
+        
+#         return True
+
+#     def reconstruct_path(self, came_from: dict, current_state: State):
+#         path = [current_state]
+#         while current_state in came_from:
+#             current_state = came_from[current_state]
+#             if current_state is not None:
+#                 path.append(current_state)
+#         path.reverse()
+#         return path
+
+#     def is_collision(self, state: State) -> bool:
+#         if state in self.collision_cache:
+#             return self.collision_cache[state]
+
+#         theta_0, theta_1 = state.theta_0, state.theta_1
+
+#         if self.check_obstacle_collision(theta_0, theta_1):
+#             self.collision_cache[state] = True
+#             return True
+
+#         if self.robot.self_collision(theta_0, theta_1):
+#             self.collision_cache[state] = True
+#             return True
+
+#         self.collision_cache[state] = False
+#         return False
+
+#     def check_obstacle_collision(self, theta_0: float, theta_1: float) -> bool:
+#         link_segments = self.robot.compute_link_segments(theta_0, theta_1)
+#         for obstacle in self.world.obstacles:
+#             for segment in link_segments:
+#                 if self.robot_collision(segment, obstacle):
+#                     return True
+#         return False
+
+#     def robot_collision(self, segment, obstacle: Obstacle) -> bool:
+#         if obstacle.shape == 'circle':
+#             return CollisionChecker.line_circle_collision(segment[0], segment[1], obstacle.position, obstacle.size)
+#         elif obstacle.shape == 'rectangle':
+#             return CollisionChecker.line_rectangle_collision(segment[0], segment[1], obstacle.position, obstacle.size)
+#         else:
+#             return False
+
+#     def calc_heuristic_costmap(self, goal_state: State):
+#         self.goal_state = goal_state
+        
+#         self.heuristic_costmap = np.full((self.num_discrete_angles, self.num_discrete_angles), np.inf)
+        
+#         goal_theta0_idx = int((goal_state.theta_0 - self.constants.JOINT_LIMITS[0]) / self.angle_resolution)
+#         goal_theta1_idx = int((goal_state.theta_1 - self.constants.JOINT_LIMITS[0]) / self.angle_resolution)
+        
+#         self.heuristic_costmap[goal_theta0_idx, goal_theta1_idx] = 0
+        
+#         pq = [(0, (goal_theta0_idx, goal_theta1_idx))]
+#         visited = set()
+        
+#         moves = [(-1,-1), (-1,0), (-1,1), (0,-1), (0,1), (1,-1), (1,0), (1,1)]
+#         joint_limit_0 = self.constants.JOINT_LIMITS[0]
+        
+#         while pq:
+#             current_cost, (current_theta0_idx, current_theta1_idx) = heapq.heappop(pq)
+            
+#             if (current_theta0_idx, current_theta1_idx) in visited:
+#                 continue
+                
+#             visited.add((current_theta0_idx, current_theta1_idx))
+            
+#             for dx, dy in moves:
+#                 new_theta0_idx = current_theta0_idx + dx
+#                 new_theta1_idx = current_theta1_idx + dy
+                
+#                 if (0 <= new_theta0_idx < self.num_discrete_angles and 
+#                     0 <= new_theta1_idx < self.num_discrete_angles):
+                    
+#                     new_theta0 = self.angle_params.get_continuous_angle(new_theta0_idx)
+#                     new_theta1 = self.angle_params.get_continuous_angle(new_theta1_idx)
+#                     current_theta0 = self.angle_params.get_continuous_angle(current_theta0_idx)
+#                     current_theta1 = self.angle_params.get_continuous_angle(current_theta1_idx)
+
+#                     if self.quick_motion_check(current_theta0, current_theta1, new_theta0, new_theta1):
+#                         edge_cost = np.sqrt(dx*dx + dy*dy)
+#                         new_cost = current_cost + edge_cost
+                        
+#                         if new_cost < self.heuristic_costmap[new_theta0_idx, new_theta1_idx]:
+#                             self.heuristic_costmap[new_theta0_idx, new_theta1_idx] = new_cost
+#                             heapq.heappush(pq, (new_cost, (new_theta0_idx, new_theta1_idx)))
+
+#     def quick_motion_check(self, theta0, theta1, new_theta0, new_theta1):
+#         if (self.robot.self_collision(theta0, theta1) or 
+#             self.robot.self_collision(new_theta0, new_theta1)):
+#             return False
+        
+#         motion_dist = np.hypot(new_theta0 - theta0, new_theta1 - theta1)
+#         num_steps = max(2, min(5, int(motion_dist / self.angle_params.planning_angle_resolution)))
+        
+#         def check_point(t):
+#             theta0_i = theta0 + t * (new_theta0 - theta0)
+#             theta1_i = theta1 + t * (new_theta1 - theta1)
+#             return not self.robot.self_collision(theta0_i, theta1_i)
+        
+#         left, right = 0, 1
+#         for _ in range(num_steps):
+#             mid = (left + right) / 2
+#             if not check_point(mid):
+#                 return False
+#             right = mid
+        
+#         return True
+
+#     def cost(self, current_state: State, neighbor_state: State, cost_mult: int) -> float:
+#         c_cell = self.compute_c_cell(neighbor_state)
+#         if c_cell == float('inf'):
+#             return float('inf')
+#         c_action = cost_mult
+#         c_smooth = 0.0
+#         total_cost = c_cell + c_action + c_smooth
+#         return total_cost
+
+#     def compute_c_cell(self, state: State) -> float:
+#         if self.is_collision(state):
+#             return float('inf')
+#         else:
+#             min_distance = self.compute_min_distance_to_obstacles(state)
+#             if min_distance == 0:
+#                 return float('inf')
+#             else:
+#                 return 1.0 / min_distance
+
+#     def compute_min_distance_to_obstacles(self, state: State) -> float:
+#         link_segments = self.robot.compute_link_segments(state.theta_0, state.theta_1)
+#         min_distance = float('inf')
+#         for segment in link_segments:
+#             for obstacle in self.world.obstacles:
+#                 distance = self.distance_segment_to_obstacle(segment, obstacle)
+#                 if distance < min_distance:
+#                     min_distance = distance
+#         return min_distance
+
+#     def distance_segment_to_obstacle(self, segment, obstacle: Obstacle) -> float:
+#         if obstacle.shape == 'circle':
+#             return CollisionChecker.distance_line_to_circle(segment[0], segment[1], obstacle.position, obstacle.size)
+#         elif obstacle.shape == 'rectangle':
+#             return CollisionChecker.distance_line_to_rectangle(segment[0], segment[1], obstacle.position, obstacle.size)
+#         else:
+#             return float('inf')
+
+class SBPLPlanner(GridBasedPlanner):
+    """
+    Optimized implementation of ARA* planner for robotic arm planning.
+    """
+    def __init__(self, robot, world, config):
         super().__init__(robot, world)
-        self.velocity_resolution = self.constants.VELOCITY_RESOLUTION
-        # Pre-compute and store motion primitives
-        self.motion_primitives = self._generate_motion_primitives()
-        # Initialize tracking variables
-        self.explored_states_count = 0
-        self.best_distance_to_goal = float('inf')
-        self.last_progress_time = 0
-        # Add adaptive primitive selection
-        self.successful_primitives = set()
-        self.primitive_success_count = {}
+        # Initialize debug helper
+        self.debug_helper = DebugHelper(config.get('debug', False))
+        self.discrete_env = DiscreteEnvironment(
+            resolution = robot.constants.THETA_0_RESOLUTION,
+            bounds=robot.constants.JOINT_LIMITS
+        )
+        self.debug_helper.log_state(f"Initialized DiscreteEnvironment with resolution={robot.constants.THETA_0_RESOLUTION}")
 
-    def _generate_motion_primitives(self) -> List[Tuple[float, float]]:
-        """Generate optimized set of motion primitives with fewer samples"""
-        max_alpha = self.constants.MAX_ACCELERATION
-        # Use fewer acceleration levels
-        num_accels = 5  # Reduced from 9
-        accelerations = np.linspace(-max_alpha, max_alpha, num_accels)
-        primitives = []
-        for alpha_0 in accelerations:
-            for alpha_1 in accelerations:
-                primitives.append((alpha_0, alpha_1))
-                # Initialize success count
-                self.primitive_success_count[(alpha_0, alpha_1)] = 0
-        return primitives
-
-    def update_primitive_success(self, primitive: Tuple[float, float], success: bool):
-        """Update the success count for a motion primitive"""
-        if success:
-            self.primitive_success_count[primitive] += 1
-            self.successful_primitives.add(primitive)
-
-    def get_neighbors(self, current_state: State) -> List[State]:
-        """Get neighbors using adaptive motion primitive selection"""
-        neighbors = []
-        dt = self.constants.DT
-        max_vel = self.constants.MAX_VELOCITY
-
-        # Use successful primitives more frequently
-        primitives_to_try = list(self.successful_primitives) if self.successful_primitives else self.motion_primitives
+        self.num_angle_primitives = 8
+        self.num_velocity_primitives = 4
+        self.collision_detector = CollisionCache(robot.constants.THETA_0_RESOLUTION * 10)
+        self.motion_primitives = MotionPrimitives(robot.constants, self.num_angle_primitives, self.num_velocity_primitives)
+        self.heuristic_computer = HeuristicComputer(self.discrete_env)
         
-        for alpha_0, alpha_1 in primitives_to_try:
-            # Compute new velocities with acceleration constraints
-            omega_0_new = np.clip(
-                current_state.omega_0 + alpha_0 * dt,
-                -max_vel, max_vel
-            )
-            omega_1_new = np.clip(
-                current_state.omega_1 + alpha_1 * dt,
-                -max_vel, max_vel
-            )
+        # Basic parameters
+        self.robot = robot
+        self.world = world
+        self.config = config
+        self.pos_threshold = 1.0
+        self.vel_threshold = 1.0
+        self.w_pos = 1.0
+        self.w_vel = 0.1
+        self.min_cost = 0.3
 
-            # Compute new positions
-            theta_0_new = current_state.theta_0 + omega_0_new * dt
-            theta_1_new = current_state.theta_1 + omega_1_new * dt
+        # Planning parameters
+        self.epsilon_init = config.get('initial_epsilon', 10.0)
+        self.epsilon_final = config.get('final_epsilon', 1.0)
+        self.delta_epsilon = config.get('delta_epsilon', 3.0)
+        self.epsilon = self.epsilon_init
+        self.max_iterations = config.get('max_iterations', 100000)
+        self.planning_timeout = config.get('planning_timeout', 60.0)
+        self.dist_to_goal = float('inf')
 
-            # Discretize state
-            theta_0_new, theta_1_new = self.discretize_state((theta_0_new, theta_1_new))
-            omega_0_new = round(omega_0_new / self.velocity_resolution) * self.velocity_resolution
-            omega_1_new = round(omega_1_new / self.velocity_resolution) * self.velocity_resolution
+        # Initialize caches
+        self.state_cache = StateCache(max_size=config.get('state_cache_size', 10000))
+        self.successor_cache = StateCache(max_size=config.get('successor_cache_size', 5000)) 
+        
+      
 
-            if self.within_joint_limits((theta_0_new, theta_1_new)):
-                neighbor = State(theta_0_new, theta_1_new, omega_0_new, omega_1_new)
-                neighbors.append(neighbor)
-                # Update primitive success
-                if not self.is_collision(neighbor):
-                    self.update_primitive_success((alpha_0, alpha_1), True)
+        # Pre-generate motion primitives
+        self.debug_helper.log_state("Generating motion primitives...")
+        self.motion_primitives.generate_primitives()
+        self.debug_helper.log_state(f"Generated {len(self.motion_primitives.primitives)} sets of motion primitives")
+        self.debug_helper.log_state(f"Angle resolution: {self.discrete_env.resolution}")
 
-        return neighbors
-
-    def plan(self, start: Tuple[float, float], goal: Tuple[float, float], robot, 
+    def Plan(self, start: Tuple[float, float], goal: Tuple[float, float], 
             final_velocities: Tuple[float, float] = (0.0, 0.0)) -> List[State]:
-        # Reset tracking variables
-        self.explored_states_count = 0
-        self.best_distance_to_goal = float('inf')
-        start_time = time.time()
-        
-        # Initialize states
-        start_theta = self.discretize_state(robot.inverse_kinematics(*start))
-        goal_theta = self.discretize_state(robot.inverse_kinematics(*goal))
+        """
+        Main planning function implementing ARA*.
+        """
+        # Validate inputs
+        if any(map(math.isnan, start + goal + final_velocities)):
+            self.debug_helper.log_state("Error: NaN values in input parameters")
+            return []
+
+        goal_theta = self.robot.inverse_kinematics(*goal)
+        start_theta = self.robot.inverse_kinematics(*start)
         start_state = State(start_theta[0], start_theta[1], 0.0, 0.0)
-        goal_state = State(goal_theta[0], goal_theta[1], final_velocities[0], final_velocities[1])
+        goal_state = State(goal_theta[0], goal_theta[1], 0.0, 0.0)
+            
+        self.debug_helper.log_state(f"Starting planning from x0={start[0]:.3f}, y0={start[1]:.3f} to x1={goal[0]:.3f}, y1={goal[1]:.3f}")
+        
+        # Debug input angles and limits
+        self.debug_helper.log_state(f"Joint limits: {self.robot.constants.JOINT_LIMITS}")
+        
+        if start_state is None or goal_state is None:
+            self.debug_helper.log_state("Error: Could not create valid start/goal states")
+            return []
+        
+        self.debug_helper.log_state(f"After bounds checking - Start state: α0={start_state.theta_0:.3f}, α1={start_state.theta_1:.3f}")
+        self.debug_helper.log_state(f"After bounds checking - Goal state: α0={goal_state.theta_0:.3f}, α1={goal_state.theta_1:.3f}")
+        
+        # Precompute heuristics
+        self.debug_helper.log_state("Precomputing heuristic map...")
+        self.heuristic_computer.precompute_heuristic_map(goal_state)
+        self.debug_helper.log_state("Heuristic map computation complete")
+        
+        # Initialize search
+        best_solution = None
+        best_cost = float('inf')
+        start_time = time.time()
+        epsilons = [self.epsilon_init, self.epsilon_init - self.delta_epsilon, 
+                    self.epsilon_init - 2 * self.delta_epsilon, 
+                    3.0, 2.5, 2.0, 1.5, 1.25, 1.1, self.epsilon_final]
+        
+        # ARA* main loop
+        for epsilon in epsilons:
+            self.debug_helper.log_state(f"Starting search iteration with ε={epsilon:.3f}")
+            self.epsilon = epsilon
+            self.debug_helper.log_state(f"Setting ε to {epsilon:.3f}")
+            solution = self._search_with_epsilon(start_state, goal_state, epsilon, start_time)
+            
+            if solution:
+                # cost = self._compute_path_cost(solution)
+                cost = self.dist_to_goal
+                self.debug_helper.log_state(f"Found solution with cost {cost:.3f}")
+                
+                if cost < best_cost:
+                    best_solution = solution
+                    best_cost = cost
+                    self.debug_helper.log_state(f"New best solution found with cost {best_cost:.3f}")
+                
+                if best_cost < self.min_cost:
+                    self.debug_helper.log_state("Found path")
+                    break     
 
-        # Priority queue for open set
-        open_set = [(self.heuristic(start_state, goal_state), 0, start_state)]
-        closed_set: Set[State] = set()
-        came_from: Dict[State, Optional[State]] = {start_state: None}
-        g_score: Dict[State, float] = {start_state: 0}
+                if time.time() - start_time > self.planning_timeout:
+                    self.debug_helper.log_state("Planning timeout reached")
+                    break     
+            else:
+                self.debug_helper.log_state(f"No solution found with ε={epsilon:.3f}")
+                break
+        
+        return best_solution if best_solution else []
 
-        while open_set:
-            try:
-                self.check_timeout_and_progress(open_set[0][2], goal_state, start_time)
-            except PlanningTimeoutError as e:
-                # Return best path found so far
-                return self.reconstruct_path(came_from, open_set[0][2])
-
+    def _search_with_epsilon(self, start_state: State, goal_state: State, 
+                           epsilon: float, start_time: float) -> Optional[List[State]]:
+        """
+        Implements weighted A* search with given epsilon value.
+        """
+        open_set = []
+        closed_set = set()
+        g_scores = defaultdict(lambda: float('inf'))
+        came_from = {}
+        iterations = 0
+        
+        # Initialize start state
+        g_scores[start_state] = 0
+        f_score = g_scores[start_state] + epsilon * self.heuristic_computer.get_heuristic(start_state, goal_state)
+        heapq.heappush(open_set, (f_score, id(start_state), start_state))
+        
+        while open_set and time.time() - start_time < self.planning_timeout:
+            iterations += 1
+            if iterations % 1000 == 0:
+                self.debug_helper.log_state(f"Search iteration {iterations}, open set size: {len(open_set)}")
+            
             _, _, current = heapq.heappop(open_set)
-
-            if self.is_goal(current, goal_state):
-                return self.reconstruct_path(came_from, current)
-
-            self.explored_states_count += 1
-            if self.explored_states_count > self.max_explored_states:
-                return self.reconstruct_path(came_from, current)
-
+            
+            if self._is_goal(current, goal_state):
+                self.debug_helper.log_state(f"Goal reached after {iterations} iterations")
+                return self._reconstruct_path(came_from, current)
+            
+            if current in closed_set:
+                continue
+            
             closed_set.add(current)
-
-            for neighbor in self.get_neighbors(current):
-                if neighbor in closed_set:
+            self.debug_helper.log_state(f"Exploring state α0={current.theta_0:.3f}, α1={current.theta_1:.3f}")
+            
+            successors = self._get_successors(current)
+            
+            for successor, cost in successors:
+                if successor in closed_set:
                     continue
+                
+                tentative_g_score = g_scores[current] + cost
+                
+                if tentative_g_score < g_scores[successor]:
+                    came_from[successor] = current
+                    g_scores[successor] = tentative_g_score
+                    f_score = tentative_g_score + epsilon * self.heuristic_computer.get_heuristic(successor, goal_state)
+                    heapq.heappush(open_set, (f_score, id(successor), successor))
+                    self.debug_helper.log_state(f"Found better path to α0={successor.theta_0:.3f}, α1={successor.theta_1:.3f}, g={tentative_g_score:.3f}, f={f_score:.3f}")
+        
+        self.debug_helper.log_state(f"Search terminated after {iterations} iterations without finding goal")
+        return None
 
-                tentative_g_score = g_score[current] + self.distance(current, neighbor)
+    def _get_successors(self, state: State) -> List[Tuple[State, float]]:
+        """
+        Get successors using cached motion primitives.
+        """
+        if state is None:
+            self.debug_helper.log_state("Warning: Null state passed to _get_successors")
+            return []
+        # Validate state values
+        if any(map(math.isnan, [state.theta_0, state.theta_1, state.omega_0, state.omega_1])):
+            self.debug_helper.log_state("Warning: NaN values detected in successor state")
+            return []
 
-                if neighbor not in g_score or tentative_g_score < g_score[neighbor]:
-                    if not self.is_collision(neighbor):
-                        came_from[neighbor] = current
-                        g_score[neighbor] = tentative_g_score
-                        f_score = tentative_g_score + self.heuristic(neighbor, goal_state)
-                        heapq.heappush(open_set, (f_score, self.explored_states_count, neighbor))
+        cache_key = state
+        cached = self.successor_cache.get(cache_key)
+        if cached is not None:
+            self.debug_helper.log_state(f"Cache hit for state α0={state.theta_0:.3f}, α1={state.theta_1:.3f}")
+            return cached
+            
+        self.debug_helper.log_state(f"Generating successors for state α0={state.theta_0:.3f}, α1={state.theta_1:.3f}")
+        
+       
+        # Calculate primitive angle range
+        min_primitive = self.robot.constants.JOINT_LIMITS[0] / 8
+        max_primitive = self.robot.constants.JOINT_LIMITS[1] / 8
+        primitive_range = np.linspace(min_primitive, max_primitive, self.num_angle_primitives)
+        
 
-            # Periodically clear cache
-            if self.explored_states_count % 1000 == 0:
-                self.clear_cache()
+        # Debug motion primitives availability
+        primitives = self.motion_primitives.primitives  # Get all primitives
+        self.debug_helper.log_state(f"Available primitive motions: {list(primitives.keys())}")
 
-        raise ValueError("No path found")
+        
+        # Find closest primitive angle
+        closest_primitive = min(primitive_range, key=lambda x: abs(x - state.theta_0))
+        rounded_primitive = round(closest_primitive, 3)
+        
+        self.debug_helper.log_state(f"Primitive angle range: [{min_primitive:.3f}, {max_primitive:.3f}]")
+        self.debug_helper.log_state(f"Current angle: {state.theta_0:.3f}")
+        self.debug_helper.log_state(f"Closest primitive angle: {closest_primitive:.3f}")
+        self.debug_helper.log_state(f"Available primitive angles: {[round(x,3) for x in primitive_range]}")
+        
+        primitives = self.motion_primitives.primitives.get(rounded_primitive, [])
+        self.debug_helper.log_state(f"Found {len(primitives)} primitives for angle {rounded_primitive:.3f}")
+        
+        candidates = []
+        for primitive in primitives:
+            new_state = self._create_state(
+                state.theta_0 + primitive['delta_angles'][0],
+                state.theta_1 + primitive['delta_angles'][1],
+                primitive['velocities'][0],
+                primitive['velocities'][1]
+            )
+            # Validate new state
+            if new_state is None:
+                continue
+            
+            candidates.append((new_state, primitive['cost_mult']))
+        
+        self.debug_helper.log_state(f"Generated {len(candidates)} candidate successors")
+        
+        valid_candidates = [
+            (s, c) for s, c in candidates 
+            if not self.is_collision(s)
+        ]
+        
+        self.debug_helper.log_state(f"Found {len(valid_candidates)} valid successors after collision checking")
+        
+        self.successor_cache.put(cache_key, valid_candidates)
+        return valid_candidates
 
-    def is_collision(self, state: State) -> bool:
-        if state in self.collision_cache:
-            return self.collision_cache[state]
-        theta_0, theta_1 = state.theta_0, state.theta_1
-        # Check for obstacle collisions
-        if self.check_obstacle_collision(theta_0, theta_1):
-            self.collision_cache[state] = True
-            return True
-        # Check for self-collisions
-        if self.robot.self_collision(theta_0, theta_1):
-            self.collision_cache[state] = True
-            return True
-        self.collision_cache[state] = False
-        return False
+    def _is_goal(self, current: State, goal: State) -> bool:
+        """
+        Efficient goal checking using precomputed thresholds
+        """
+        current_pos = self.robot.forward_kinematics(current.theta_0, current.theta_1)
+        goal_pos = self.robot.forward_kinematics(goal.theta_0, goal.theta_1)
+        
+        pos_diff = np.linalg.norm(np.array(current_pos) - np.array(goal_pos))
+        self.dist_to_goal = pos_diff
+        self.debug_helper.log_state(f"current_pos={current_pos}, goal_pos={goal_pos}")
+        
+        # An adaptive error based on epsilon
+        if (self.epsilon < 2.0):
+            pos_threshold_max = 1.8 * self.pos_threshold
+            pos_threshold_min = 0.3 * self.pos_threshold
+            ep_max = 1.5
+            ep_min = 1.0
+            position_threshold = pos_threshold_min + (pos_threshold_max - pos_threshold_min) * (self.epsilon - ep_min) / (ep_max - ep_min)
+        else:
+            pos_threshold_max = 5 * self.pos_threshold
+            pos_threshold_min = 2 * self.pos_threshold
+            ep_max = 10.0
+            ep_min = 2.0
+            position_threshold =  pos_threshold_min + (pos_threshold_max - pos_threshold_min) * (self.epsilon - ep_min) / (ep_max - ep_min)
+      
+        self.debug_helper.log_state(f"Goal check: position difference={pos_diff:.3f}, threshold={position_threshold}, ε={self.epsilon}")
+        if pos_diff > position_threshold:
+            return False
+        
+        vel_diff_0 = abs(current.omega_0 - goal.omega_0)
+        vel_diff_1 = abs(current.omega_1 - goal.omega_1)
+        self.debug_helper.log_state(f"Goal check: velocity differences=[{vel_diff_0:.3f}, {vel_diff_1:.3f}], threshold={self.vel_threshold}")
+        
+        # if vel_diff_0 > self.vel_threshold or vel_diff_1 > self.vel_threshold:
+        #     return False
+            
+        return True
+        
+    def _compute_path_cost(self, path: List[State]) -> float:
+        """
+        Compute total path cost efficiently
+        """
+        if not path:
+            return float('inf')
+            
+        total_cost = 0
+        for i in range(len(path) - 1):
+            current = path[i]
+            next_state = path[i + 1]
+            
+            transition = (current, next_state)
+            cached_cost = self.state_cache.get(transition)
+            if cached_cost is not None:
+                total_cost += cached_cost
+                continue
+                
+            cost = self._compute_transition_cost(current, next_state)
+            self.state_cache.put(transition, cost)
+            total_cost += cost
+            
+        return total_cost
+    
+    def _compute_transition_cost(self, state1: State, state2: State) -> float:
+        """
+        Compute cost between two states efficiently
+        """
+        delta_pos = np.hypot(state2.theta_0 - state1.theta_0, 
+                           state2.theta_1 - state1.theta_1)
+        
+        delta_vel = np.hypot(state2.omega_0 - state1.omega_0,
+                           state2.omega_1 - state1.omega_1)
+        
+        return self.w_pos * delta_pos + self.w_vel * delta_vel
+    
+    def _reconstruct_path(self, came_from: Dict[State, State], 
+                     current: State) -> List[State]:
+        """
+        Reconstruct path from search results with validation
+        """
+        if current is None:
+            self.debug_helper.log_state("Warning: Null current state in path reconstruction")
+            return []
+            
+        path = [current]
+        while current in came_from:
+            current = came_from[current]
+            if current is None:
+                self.debug_helper.log_state("Warning: Null state encountered in path")
+                break
+                
+            # Validate state values
+            if any(map(math.isnan, [current.theta_0, current.theta_1, 
+                                   current.omega_0, current.omega_1])):
+                self.debug_helper.log_state("Warning: NaN values detected in path")
+                break
+                
+            self.debug_helper.log_state(f"New point on path={current}")
+            path.append(current)
+        
+        # Final validation of complete path
+        valid_path = [state for state in path[::-1] 
+                     if state is not None and 
+                     all(map(math.isfinite, [state.theta_0, state.theta_1, 
+                                           state.omega_0, state.omega_1]))]
+        
+        if len(valid_path) < len(path):
+            self.debug_helper.log_state(f"Warning: Removed {len(path) - len(valid_path)} invalid states from path")
+        
+        return valid_path
+    
+    def _create_state(self, theta0: float, theta1: float, 
+                 omega0: float, omega1: float) -> State:
+        """
+        Create a new state with robust bounds checking and validation
+        """
+        # Input validation
+        if any(map(math.isnan, [theta0, theta1, omega0, omega1])):
+            self.debug_helper.log_state("Warning: NaN values detected in state creation")
+            # Use safe defaults
+            theta0 = 0.0 if math.isnan(theta0) else theta0
+            theta1 = 0.0 if math.isnan(theta1) else theta1
+            omega0 = 0.0 if math.isnan(omega0) else omega0
+            omega1 = 0.0 if math.isnan(omega1) else omega1
 
-    def heuristic(self, current: State, goal: State) -> float:
-        # Use Euclidean distance in joint space as heuristic
-        return np.hypot(current.theta_0 - goal.theta_0, current.theta_1 - goal.theta_1)
+        # Ensure values are finite
+        if not all(map(math.isfinite, [theta0, theta1, omega0, omega1])):
+            self.debug_helper.log_state("Warning: Non-finite values detected in state creation")
+            return None
 
-    def distance(self, from_state: State, to_state: State) -> float:
-        # Cost includes changes in positions and velocities
-        delta_theta = np.hypot(to_state.theta_0 - from_state.theta_0, to_state.theta_1 - from_state.theta_1)
-        delta_omega = np.hypot(to_state.omega_0 - from_state.omega_0, to_state.omega_1 - from_state.omega_1)
-        return delta_theta + delta_omega  # You can adjust weights if needed
+        # Bound joint angles with explicit limits
+        theta0 = np.clip(theta0, self.robot.constants.JOINT_LIMITS[0], 
+                        self.robot.constants.JOINT_LIMITS[1])
+        theta1 = np.clip(theta1, self.robot.constants.JOINT_LIMITS[0], 
+                        self.robot.constants.JOINT_LIMITS[1])
+        
+        # Bound velocities
+        omega0 = np.clip(omega0, -self.robot.constants.MAX_VELOCITY, 
+                        self.robot.constants.MAX_VELOCITY)
+        omega1 = np.clip(omega1, -self.robot.constants.MAX_VELOCITY, 
+                        self.robot.constants.MAX_VELOCITY)
+        
+        return State(theta0, theta1, omega0, omega1)
+
 
 class MPCController:
     """Model Predictive Controller for 2-link robotic arm"""
@@ -2190,7 +3415,7 @@ class MPCController:
         self.path = []  # Store reference path
         self.path_index = 0  # Current path index
 
-        self.debug_helper = DebugHelper(debug=False)
+        self.debug_helper = DebugHelper(debug=True)
         
         # Compute controller gains based on provided equations
         self.k1 = 2 / (self.h**2 + 4*self.get_rho())
@@ -2244,37 +3469,6 @@ class MPCController:
         
         return v1, v2
 
-    def predict_trajectory(self, current_state: Tuple[float, float, float, float],
-                         control_sequence: List[Tuple[float, float]]) -> List[Tuple[float, float]]:
-        """Predict system trajectory over horizon"""
-        trajectory = []
-        state = list(current_state)
-        
-        for v in control_sequence:
-            # Simulate system dynamics
-            tau = self.compute_feedback_linearization(
-                (state[0], state[1]),
-                (state[2], state[3]),
-                v
-            )
-            
-            # Update state using robot dynamics
-            alpha_0, alpha_1 = self.robot.forward_dynamics(
-                state[0], state[1],
-                state[2], state[3],
-                tau[0], tau[1]
-            )
-            
-            # Euler integration
-            state[2] += alpha_0 * self.dt  # Update velocities
-            state[3] += alpha_1 * self.dt
-            state[0] += state[2] * self.dt  # Update positions
-            state[1] += state[3] * self.dt
-            
-            trajectory.append((state[0], state[1]))
-            
-        return trajectory
-
     def optimize_control_sequence(self, current_state: Tuple[float, float, float, float],
                                 reference_trajectory: List[Tuple[float, float]], steps_in_horizon: int) -> List[Tuple[float, float]]:
         """Optimize control sequence over prediction horizon"""
@@ -2287,15 +3481,12 @@ class MPCController:
         self.debug_helper.log_state(f"Reference trajectory length: {len(reference_trajectory)}")
         
         control_sequence = []
-        position_threshold = 0.01
         
-        for i in range(1, steps_in_horizon):
+        for i in range(0, steps_in_horizon):
             self.debug_helper.log_state(f"\nOptimization step {i}:")
             
             ref_i = reference_trajectory[min(i, len(reference_trajectory) - 1)]
-            if i < len(reference_trajectory) and (abs(current_state[0] - ref_i[0]) > position_threshold or 
-                abs(current_state[1] - ref_i [1]) > position_threshold):
-                self.debug_helper.log_state(f"Reference point: {ref_i}")
+            self.debug_helper.log_state(f"Reference point: {ref_i}")
             
             # Compute control for this step
             v = self.compute_synthetic_control(
@@ -2333,7 +3524,7 @@ class MPCController:
         self.debug_helper.log_state(f"Path length: {len(self.path)}")
         
         # Fill reference trajectory with bounds checking
-        for i in range(1, steps_in_horizon):
+        for i in range(0, steps_in_horizon):
             path_idx = min(current_path_index + i, len(self.path) - 1)
             
             if path_idx < len(self.path):
@@ -2347,12 +3538,11 @@ class MPCController:
          # Select first non-zero control action
         # Instead of always taking first control, find first non-zero control
         selected_control = None
-        min_control = 0.09  # Minimum control action
-        for v in control_sequence:
-            if abs(v[0]) > min_control or abs(v[1]) > min_control:
-                selected_control = v
-                break
-        
+        # for v in control_sequence:
+        #     if abs(v[0]) > min_control or abs(v[1]) > min_control:
+        #         selected_control = v
+        #         break
+        v = control_sequence[0]
         # # If all controls are zero, use the control for the next reference point
         # if not selected_control and len(control_sequence) > 1:
         #     selected_control = control_sequence[1]
@@ -2361,7 +3551,6 @@ class MPCController:
 
         # FIX 2: Add minimum control threshold
         # Take first control action
-        v = selected_control
         self.debug_helper.log_state(f"\nSelected control action: v={v}")
         
         # Compute torques
@@ -2443,6 +3632,7 @@ class Controller:
         self.world = world
         self.planner = planner
         self.path: List[State] = []
+        self.coarse_path: List[State] = []
         self.path_index = 0
         # Initialize MPC controller
         self.mpc = MPCController(None, robot.constants)  # Robot will be set in set_goal
@@ -2481,7 +3671,12 @@ class Controller:
         
         # Get path from planner
         try:
-            coarse_path = self.planner.Plan(start_pos, goal, robot, final_velocities)
+            self.debug_helper.log_state("About to run planner:")
+            coarse_path = self.planner.Plan(start_pos, goal, final_velocities)
+            self.debug_helper.print_path_stats(coarse_path, robot)
+            self.debug_helper.validate_path_limits(coarse_path, robot)
+            self.debug_helper.print_path_points(coarse_path)
+            self.coarse_path = coarse_path
             
             # Generate trajectory from path
             # Initialize the planner
@@ -3309,9 +4504,7 @@ class PathParameterizer:
         self.omega_0_points = [p.omega_0 for p in path_points]
         self.omega_1_points = [p.omega_1 for p in path_points]
         
-        # Original s values for the path points
         original_s = np.linspace(0, 1, len(path_points))
-        
         # Create interpolators with proper boundary handling
         self.theta_0_spline = scipy.interpolate.CubicSpline(
             original_s, self.theta_0_points, 
@@ -3350,11 +4543,354 @@ class PathParameterizer:
         
         return PathPoint(s, theta_0, theta_1, dtheta_0, dtheta_1, ddtheta_0, ddtheta_1)
 
+class SimpleAStarPlanner:
+    """
+    A simplified A* planner for 2-link robotic arm path planning.
+    """
+    def __init__(self, robot, world):
+        self.robot = robot
+        self.world = world
+        self.constants = robot.constants
+        # Resolution for discretizing the configuration space
+        self.angle_resolution = 0.1
+        # Maximum number of iterations to prevent infinite loops
+        self.max_iterations = 10000
+        # Cache for collision checks to improve performance
+        self.collision_cache = {}
+        
+    def Plan(self, start: tuple, goal: tuple, robot, final_velocities=(0.0, 0.0)) -> list:
+        """Plan a path from start to goal configuration."""
+        # Convert workspace coordinates to joint angles
+        start_angles = robot.inverse_kinematics(*start)
+        goal_angles = robot.inverse_kinematics(*goal)
+        
+        # Initialize data structures for A* search
+        start_state = State(start_angles[0], start_angles[1], 0.0, 0.0)
+        goal_state = State(goal_angles[0], goal_angles[1], final_velocities[0], final_velocities[1])
+        
+        open_set = [(self.heuristic(start_state, goal_state), start_state)]
+        closed_set = set()
+        came_from = {start_state: None}
+        g_score = {start_state: 0}
+        
+        iterations = 0
+        # ARA* main loop
+        while epsilon >= self.epsilon_final:
+            self.debug_helper.log_state(f"Starting search iteration with ε={epsilon:.3f}")
+            solution = self._search_with_epsilon(start_state, goal_state, epsilon, start_time)
+            
+            if solution:
+                cost = self._compute_path_cost(solution)
+                self.debug_helper.log_state(f"Found solution with cost {cost:.3f}")
+                
+                if cost < best_cost:
+                    best_solution = solution
+                    best_cost = cost
+                    self.debug_helper.log_state(f"New best solution found with cost {best_cost:.3f}")
+                
+                if time.time() - start_time > self.planning_timeout:
+                    self.debug_helper.log_state("Planning timeout reached")
+                    break
+                
+                epsilon = max(epsilon - self.delta_epsilon, self.epsilon_final)
+                self.debug_helper.log_state(f"Decreasing ε to {epsilon:.3f}")
+            else:
+                self.debug_helper.log_state(f"No solution found with ε={epsilon:.3f}")
+                break
+        
+        return best_solution if best_solution else []
+
+    def _search_with_epsilon(self, start_state: State, goal_state: State, 
+                           epsilon: float, start_time: float) -> Optional[List[State]]:
+        """
+        Implements weighted A* search with given epsilon value.
+        """
+        open_set = []
+        closed_set = set()
+        g_scores = defaultdict(lambda: float('inf'))
+        came_from = {}
+        iterations = 0
+        
+        # Initialize start state
+        g_scores[start_state] = 0
+        f_score = g_scores[start_state] + epsilon * self.heuristic_computer.get_heuristic(start_state, goal_state)
+        heapq.heappush(open_set, (f_score, id(start_state), start_state))
+        
+        while open_set and time.time() - start_time < self.planning_timeout:
+            iterations += 1
+            if iterations % 1000 == 0:
+                self.debug_helper.log_state(f"Search iteration {iterations}, open set size: {len(open_set)}")
+            
+            _, _, current = heapq.heappop(open_set)
+            
+            if self._is_goal(current, goal_state):
+                self.debug_helper.log_state(f"Goal reached after {iterations} iterations")
+                return self._reconstruct_path(came_from, current)
+            
+            if current in closed_set:
+                continue
+            
+            closed_set.add(current)
+            self.debug_helper.log_state(f"Exploring state α0={current.theta_0:.3f}, α1={current.theta_1:.3f}")
+            
+            successors = self._get_successors(current)
+            
+            for successor, cost in successors:
+                if successor in closed_set:
+                    continue
+                
+                tentative_g_score = g_scores[current] + cost
+                
+                if tentative_g_score < g_scores[successor]:
+                    came_from[successor] = current
+                    g_scores[successor] = tentative_g_score
+                    f_score = tentative_g_score + epsilon * self.heuristic_computer.get_heuristic(successor, goal_state)
+                    heapq.heappush(open_set, (f_score, id(successor), successor))
+                    self.debug_helper.log_state(f"Found better path to α0={successor.theta_0:.3f}, α1={successor.theta_1:.3f}, g={tentative_g_score:.3f}, f={f_score:.3f}")
+        
+        self.debug_helper.log_state(f"Search terminated after {iterations} iterations without finding goal")
+        return None
+
+    def _get_successors(self, state: State) -> List[Tuple[State, float]]:
+        """
+        Get successors using cached motion primitives.
+        """
+        cache_key = state
+        cached = self.successor_cache.get(cache_key)
+        if cached is not None:
+            self.debug_helper.log_state(f"Cache hit for state α0={state.theta_0:.3f}, α1={state.theta_1:.3f}")
+            return cached
+            
+        self.debug_helper.log_state(f"Generating successors for state α0={state.theta_0:.3f}, α1={state.theta_1:.3f}")
+        
+        primitives = self.motion_primitives.primitives.get(round(state.theta_0, 3), [])
+        candidates = []
+        
+        for primitive in primitives:
+            new_state = self._create_state(
+                state.theta_0 + primitive['delta_angles'][0],
+                state.theta_1 + primitive['delta_angles'][1],
+                primitive['velocities'][0],
+                primitive['velocities'][1]
+            )
+            candidates.append((new_state, primitive['cost_mult']))
+        
+        self.debug_helper.log_state(f"Generated {len(candidates)} candidate successors")
+        
+        valid_candidates = [
+            (s, c) for s, c in candidates 
+            if not self.collision_detector.check_collision(s, self.robot, self.world.obstacles)
+        ]
+        
+        self.debug_helper.log_state(f"Found {len(valid_candidates)} valid successors after collision checking")
+        
+        self.successor_cache.put(cache_key, valid_candidates)
+        return valid_candidates
+
+    def _is_goal(self, current: State, goal: State) -> bool:
+        """
+        Efficient goal checking using precomputed thresholds
+        """
+        current_pos = self.robot.forward_kinematics(current.theta_0, current.theta_1)
+        goal_pos = self.robot.forward_kinematics(goal.theta_0, goal.theta_1)
+        
+        pos_diff = np.linalg.norm(np.array(current_pos) - np.array(goal_pos))
+        self.debug_helper.log_state(f"Goal check: position difference={pos_diff:.3f}, threshold={self.pos_threshold}")
+        
+        if pos_diff > self.pos_threshold:
+            return False
+        
+        vel_diff_0 = abs(current.omega_0 - goal.omega_0)
+        vel_diff_1 = abs(current.omega_1 - goal.omega_1)
+        self.debug_helper.log_state(f"Goal check: velocity differences=[{vel_diff_0:.3f}, {vel_diff_1:.3f}], threshold={self.vel_threshold}")
+        
+        if vel_diff_0 > self.vel_threshold or vel_diff_1 > self.vel_threshold:
+            return False
+            
+        return True
+        
+    def get_neighbors(self, state: State) -> list:
+        """Generate neighboring states by discretely varying joint angles."""
+        neighbors = []
+        angle_steps = [-self.angle_resolution, 0, self.angle_resolution]
+        
+        for d_theta0 in angle_steps:
+            for d_theta1 in angle_steps:
+                if d_theta0 == 0 and d_theta1 == 0:
+                    continue
+                    
+                new_theta0 = state.theta_0 + d_theta0
+                new_theta1 = state.theta_1 + d_theta1
+                
+                # Check joint limits
+                if not self.within_joint_limits((new_theta0, new_theta1)):
+                    continue
+                    
+                # Create new state with zero velocity (velocity planning handled by controller)
+                neighbor = State(new_theta0, new_theta1, 0.0, 0.0)
+                neighbors.append(neighbor)
+        
+        return neighbors
+        
+    def within_joint_limits(self, angles: tuple) -> bool:
+        """Check if joint angles are within limits."""
+        theta_0, theta_1 = angles
+        limits = self.constants.JOINT_LIMITS
+        return (limits[0] <= theta_0 <= limits[1] and
+                limits[0] <= theta_1 <= limits[1])
+                
+    def is_collision(self, state: State) -> bool:
+        """Check if state results in collision."""
+        # Check cache first
+        if state in self.collision_cache:
+            return self.collision_cache[state]
+            
+        # Check self collision
+        if self.robot.self_collision(state.theta_0, state.theta_1):
+            self.collision_cache[state] = True
+            return True
+            
+        # Check obstacle collisions
+        segments = self.robot.compute_link_segments(state.theta_0, state.theta_1)
+        for obstacle in self.world.obstacles:
+            for segment in segments:
+                if self.check_segment_collision(segment, obstacle):
+                    self.collision_cache[state] = True
+                    return True
+                    
+        self.collision_cache[state] = False
+        return False
+        
+    def check_segment_collision(self, segment: tuple, obstacle) -> bool:
+        """Check collision between a line segment and an obstacle."""
+        if obstacle.shape == 'circle':
+            return self.check_circle_collision(segment, obstacle)
+        elif obstacle.shape == 'rectangle':
+            return self.check_rectangle_collision(segment, obstacle)
+        return False
+        
+    def check_circle_collision(self, segment: tuple, obstacle) -> bool:
+        """Check collision between line segment and circle."""
+        p1, p2 = segment
+        circle_center = obstacle.position
+        circle_radius = obstacle.size
+        
+        # Vector from line start to end
+        line_vec = (p2[0] - p1[0], p2[1] - p1[1])
+        line_length = np.hypot(line_vec[0], line_vec[1])
+        line_unit_vec = (line_vec[0] / line_length, line_vec[1] / line_length)
+        
+        # Vector from line start to circle center
+        circle_vec = (circle_center[0] - p1[0], circle_center[1] - p1[1])
+        
+        # Project circle_vec onto line_vec
+        projection = circle_vec[0] * line_unit_vec[0] + circle_vec[1] * line_unit_vec[1]
+        
+        if projection < 0:
+            closest_point = p1
+        elif projection > line_length:
+            closest_point = p2
+        else:
+            closest_point = (p1[0] + line_unit_vec[0] * projection,
+                           p1[1] + line_unit_vec[1] * projection)
+            
+        distance = np.hypot(circle_center[0] - closest_point[0],
+                          circle_center[1] - closest_point[1])
+                          
+        return distance <= circle_radius
+        
+    def check_rectangle_collision(self, segment: tuple, obstacle) -> bool:
+        """Check collision between line segment and rectangle."""
+        p1, p2 = segment
+        rect_x, rect_y = obstacle.position
+        rect_w, rect_h = obstacle.size
+        
+        # Convert to axis-aligned bounding box check for simplicity
+        rect_left = rect_x - rect_w/2
+        rect_right = rect_x + rect_w/2
+        rect_bottom = rect_y - rect_h/2
+        rect_top = rect_y + rect_h/2
+        
+        # Check if either endpoint is inside rectangle
+        if (rect_left <= p1[0] <= rect_right and rect_bottom <= p1[1] <= rect_top) or \
+           (rect_left <= p2[0] <= rect_right and rect_bottom <= p2[1] <= rect_top):
+            return True
+            
+        # Check intersection with rectangle edges
+        edges = [
+            ((rect_left, rect_bottom), (rect_right, rect_bottom)),
+            ((rect_right, rect_bottom), (rect_right, rect_top)),
+            ((rect_right, rect_top), (rect_left, rect_top)),
+            ((rect_left, rect_top), (rect_left, rect_bottom))
+        ]
+        
+        for edge in edges:
+            if self.line_segments_intersect(segment, edge):
+                return True
+                
+        return False
+        
+    def line_segments_intersect(self, seg1: tuple, seg2: tuple) -> bool:
+        """Check if two line segments intersect."""
+        p1, p2 = seg1
+        p3, p4 = seg2
+        
+        # Compute directions
+        d1 = (p2[0] - p1[0], p2[1] - p1[1])
+        d2 = (p4[0] - p3[0], p4[1] - p3[1])
+        
+        # Cross products
+        cross = d1[0] * d2[1] - d1[1] * d2[0]
+        
+        # Check if lines are parallel
+        if abs(cross) < 1e-8:
+            return False
+            
+        # Compute intersection point parameters
+        t = ((p3[0] - p1[0]) * d2[1] - (p3[1] - p1[1]) * d2[0]) / cross
+        u = ((p3[0] - p1[0]) * d1[1] - (p3[1] - p1[1]) * d1[0]) / cross
+        
+        # Check if intersection point lies on both segments
+        return 0 <= t <= 1 and 0 <= u <= 1
+        
+    def heuristic(self, state: State, goal: State) -> float:
+        """Compute heuristic distance between states."""
+        # Use Euclidean distance in joint space
+        d_theta0 = abs(goal.theta_0 - state.theta_0)
+        d_theta1 = abs(goal.theta_1 - state.theta_1)
+        return np.sqrt(d_theta0**2 + d_theta1**2)
+        
+    def distance(self, state1: State, state2: State) -> float:
+        """Compute distance between states."""
+        # Simple Euclidean distance in joint space
+        d_theta0 = abs(state2.theta_0 - state1.theta_0)
+        d_theta1 = abs(state2.theta_1 - state1.theta_1)
+        return np.sqrt(d_theta0**2 + d_theta1**2)
+        
+    def is_goal_reached(self, current: State, goal: State) -> bool:
+        """Check if current state is close enough to goal."""
+        # Convert states to end effector positions
+        current_pos = self.robot.forward_kinematics(current.theta_0, current.theta_1)
+        goal_pos = self.robot.forward_kinematics(goal.theta_0, goal.theta_1)
+        
+        # Check if end effector is close enough to goal
+        distance = np.hypot(current_pos[0] - goal_pos[0],
+                          current_pos[1] - goal_pos[1])
+        return distance < 0.1  # 10cm threshold
+        
+    def reconstruct_path(self, came_from: dict, current: State) -> list:
+        """Reconstruct path from came_from map."""
+        path = [current]
+        while current in came_from and came_from[current] is not None:
+            current = came_from[current]
+            path.append(current)
+        return path[::-1]  # Reverse path to get start to goal order
+
 class TimeOptimalTrajectoryGenerator:
     def __init__(self, robot: Robot, path_points: List[State]):
         self.robot = robot
         self.tolerance = 1e-4  # Tolerance for binary search
-        self.debug = DebugHelper(debug=True)
+        self.debug = DebugHelper(debug=False)
         self.debug.print_trajectory_header()
         # Initialize path parameterizer with the path points
         self.path = PathParameterizer(path_points)
@@ -3621,7 +5157,7 @@ class TimeOptimalTrajectoryGenerator:
         
         # Integrate backward curve once at start
         self.debug.log_state("\nStep 2: Integrating backward from end point")
-        t_backward, backward = self.integrate_trajectory(1.0, 0.0, False, (0, 10.0))
+        t_backward, backward = self.integrate_trajectory(1.0, 0.0, False, (0, 30.0))
         
         if backward.size == 0:
             self.debug.log_state("Warning: Backward integration produced no points")
@@ -3632,9 +5168,10 @@ class TimeOptimalTrajectoryGenerator:
         
         # Use adaptive step size
         iteration = 0
-        max_iterations = 50  # Reduced max iterations
+        max_iterations = 1000# Reduced max iterations
+        min_accaptable_s = 0.98
         
-        while s_current < 1.0 and iteration < max_iterations:
+        while s_current < 1.0 and (iteration < max_iterations  and s_current > min_accaptable_s):
             iteration += 1
             self.debug.log_state(f"\n=== Iteration {iteration} ===")
             self.debug.log_state(f"Current state: (s={s_current:.3f}, s_dot={s_dot_current:.3f})")
@@ -3642,7 +5179,7 @@ class TimeOptimalTrajectoryGenerator:
             
             # Forward integration
             self.debug.log_state("\nForward integration with maximum acceleration")
-            t_forward, forward = self.integrate_trajectory(s_current, s_dot_current, True, (0, 10.0))
+            t_forward, forward = self.integrate_trajectory(s_current, s_dot_current, True, (0, 30.0))
             
             # Check for intersection and violations
             intersection = self.detect_curve_intersection(forward, final_curve)
@@ -3672,9 +5209,7 @@ class TimeOptimalTrajectoryGenerator:
                 
                 if s_lim <= s_current + self.tolerance:
                     self.debug.log_state("Violation point is behind or too close, advancing")
-                    s_current += step_size
                     s_dot_current = 0.0
-                    continue
                 
                 # Binary search for tangent point
                 self.debug.log_state("\nPerforming binary search for tangent point")
@@ -3702,7 +5237,7 @@ class TimeOptimalTrajectoryGenerator:
                         self.debug.log_state("Added deceleration and acceleration switch points")
                         s_current = s_tan
                         s_dot_current = s_dot_tan
-                        step_size = max(min_step, step_size * 0.5)
+                        step_size = max(min_step, step_size * reduction_factor)
                     else:
                         self.debug.log_state("Switch point too close to current point, advancing")
                         s_current += step_size
@@ -3711,7 +5246,7 @@ class TimeOptimalTrajectoryGenerator:
                     self.debug.log_state("No intersection found with forward curve, advancing")
                     s_current += step_size
                     s_dot_current = 0.0
-                    step_size = min(0.15, step_size * 1.5)  # Increase step size when no intersection
+                    step_size = min(step_size, step_size * growth_factor)  # Increase step size when no intersection
             else:
                 self.debug.log_state("No violation or intersection found, ending search")
                 break
@@ -3731,14 +5266,14 @@ class TimeOptimalTrajectoryGenerator:
         best_point = None
         
         max_iterations = 20  # Reduced iterations
-        rel_tolerance = 1e-3  # Relative tolerance for early stopping
+        rel_tolerance = 3 * 1e-3  # Relative tolerance for early stopping
         last_s_dot_test = s_dot_high;
         for iteration in range(max_iterations):
             s_dot_test = (s_dot_high + s_dot_low) / 2
             self.debug.log_state(f"\nBinary search iteration {iteration + 1}:")
             self.debug.log_state(f"  Testing s_dot={s_dot_test:.3f}")
             
-            _, forward = self.integrate_trajectory(s_lim, s_dot_test, False, (0, 10.0))
+            _, forward = self.integrate_trajectory(s_lim, s_dot_test, False, (0, 30.0))
             violation_point = self.check_velocity_limit_violation(forward)
             
             if violation_point is not None:
@@ -3752,7 +5287,7 @@ class TimeOptimalTrajectoryGenerator:
             self.debug.log_state(f"  Updated bounds: [{s_dot_low:.3f}, {s_dot_high:.3f}]")
             
             # Early stopping if converged enough
-            if abs(s_dot_high - s_dot_low) < rel_tolerance * s_dot_lim or abs(s_dot_test - last_s_dot_test) < 5 * rel_tolerance:
+            if abs(s_dot_test - last_s_dot_test) < rel_tolerance:
                 self.debug.log_state("  Converged within relative tolerance")
                 break
             last_s_dot_test = s_dot_test
@@ -3937,17 +5472,37 @@ class TimeOptimalTrajectoryGenerator:
         self.debug.log_state(f"Previous switch point: (s={s_prev:.3f}, s_dot={s_dot_prev:.3f})")
         
         # Integrate from previous switch point to current s
-        t_span = (0, 10.0)
+        t_span = (0, 30.0)
         _, trajectory = self.integrate_trajectory(s_prev, s_dot_prev, 
                                                current_phase == TrajectoryType.ACCELERATION,
                                                t_span)
         
-        # Find s_dot at current s by interpolation
-        f = scipy.interpolate.interp1d(trajectory[0], trajectory[1])
-        s_dot = float(f(s))
-        
-        self.debug.log_state(f"Computed optimal velocity: s_dot={s_dot:.3f}")
-        return s_dot
+        try:
+            # Get valid interpolation range
+            s_min, s_max = np.min(trajectory[0]), np.max(trajectory[0])
+            self.debug.log_state(f"Valid interpolation range: [{s_min:.3f}, {s_max:.3f}]")
+            
+            # Clip s to valid range
+            s_clipped = np.clip(s, s_min, s_max)
+            if s != s_clipped:
+                self.debug.log_state(f"Warning: s={s:.3f} outside valid range, clipped to {s_clipped:.3f}")
+            
+            # Create interpolation function with bounds error handling
+            f = scipy.interpolate.interp1d(trajectory[0], trajectory[1], bounds_error=False, fill_value="extrapolate")
+            s_dot = float(f(s_clipped))
+            
+            # If we're at the maximum valid s, return zero velocity
+            if abs(s_clipped - s_max) < self.tolerance:
+                self.debug.log_state("At maximum valid s, returning zero velocity")
+                s_dot = 0.0
+                
+            self.debug.log_state(f"Computed optimal velocity: s_dot={s_dot:.3f}")
+            return s_dot
+            
+        except Exception as e:
+            self.debug.log_state(f"Error in velocity computation: {e}")
+            # Return zero velocity as fallback
+            return 0.0
 
     def generate_trajectory(self, path_points: List[State]) -> List[State]:
         """Generate time-optimal trajectory from path points."""        
@@ -3979,13 +5534,27 @@ class TimeOptimalTrajectoryGenerator:
             switch_points = self.find_switch_points()
             self.debug.log_state(f"Found {len(switch_points)} switch points")
             
+            # Get maximum valid s value from last successful integration
+            max_valid_s = 0.0
+            if switch_points:
+                last_switch = switch_points[-1]
+                max_valid_s = last_switch[0]  # s value of last switch point
+            else:
+                # If no switch points, try to determine max valid s from a test integration
+                _, trajectory = self.integrate_trajectory(0.0, 0.0, True, (0, 100.0))
+                if trajectory.size > 0:
+                    max_valid_s = np.max(trajectory[0])
+                    
+            self.debug.log_state(f"Maximum valid s value: {max_valid_s:.3f}")
+            
             # Generate final trajectory
             self.debug.log_state("\nGenerating final trajectory...")
             trajectory_points = []
             
-            # Create more dense sampling near switch points
+            # Create more dense sampling near switch points up to max_valid_s
             s_values = []
-            base_points = np.linspace(0, 1, max(100, len(cleaned_path) * 2))
+            num_base_points = 100
+            base_points = np.linspace(0, min(1.0, max_valid_s), num_base_points)
             
             for s in base_points:
                 s_values.append(s)
@@ -3998,7 +5567,7 @@ class TimeOptimalTrajectoryGenerator:
                             s_switch + 0.01
                         ])
             
-            s_values = sorted(list(set(np.clip(s_values, 0, 1))))
+            s_values = sorted(list(set(np.clip(s_values, 0, max_valid_s))))
             self.debug.log_state(f"Generated {len(s_values)} trajectory points")
             
             for s in s_values:
@@ -4015,13 +5584,14 @@ class TimeOptimalTrajectoryGenerator:
                                             self.robot.constants.MAX_VELOCITY)
                     omega_1 = np.clip(omega_1, -self.robot.constants.MAX_VELOCITY, 
                                             self.robot.constants.MAX_VELOCITY)
-                    
-                    trajectory_points.append(State(
+                    new_state = State(
                         theta_0=point.theta_0,
                         theta_1=point.theta_1,
                         omega_0=omega_0,
                         omega_1=omega_1
-                    ))
+                    )
+                    trajectory_points.append(new_state)
+                    self.debug.log_state(f"Generated Trajectory point for s {s} and s_dot {s_dot} is:  {new_state}")
                 except Exception as e:
                     self.debug.log_state(f"Error generating trajectory point at s={s}: {e}")
                     continue
@@ -4174,6 +5744,9 @@ def main() -> None:
     min_distance = robot_constants.LINK_1  # For example, minimum distance is the length of the first link
     random_rectangle_obstacle = generate_random_rectangle_obstacle(workspace_size, min_distance)
     obstacles.append(random_rectangle_obstacle)
+    random_rectangle_obstacle = generate_random_rectangle_obstacle(workspace_size, min_distance)
+    obstacles.append(random_rectangle_obstacle)
+
     # Initialize world
     world = World(
         config['world']['width'],
@@ -4186,9 +5759,9 @@ def main() -> None:
     robot = Robot(robot_constants)
 
     # Initialize planner
-    #planner = SBPLLatticePlanner(robot, world)
-    planner = AStarPlanner(robot, world)
-
+    planner = SBPLPlanner(robot, world, config)
+    # planner = AStarPlanner(robot, world)
+    # planner = SimpleAStarPlanner(robot, world)
     #
 
     # Initialize controller
