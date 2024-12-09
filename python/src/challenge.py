@@ -281,13 +281,6 @@ class Robot:
         return False
 
 
-class Obstacle:
-    def __init__(self, shape: str, position: Tuple[float, float], size: Union[float, Tuple[float, float]]):
-        self.shape = shape  # 'circle' or 'rectangle'
-        self.position = position
-        self.size = size
-
-
 class World:
     """
     Represents the environment where the robot operates.
@@ -300,6 +293,19 @@ class World:
         self.obstacles = obstacles if obstacles is not None else []
 
         self.debug_helper = DebugHelper(debug=True)
+
+        # Create inflated versions of obstacles
+        self.inflation = 5
+        self.inflated_obstacles = self._create_inflated_obstacles()
+
+    def _create_inflated_obstacles(self) -> List[Obstacle]:
+        """
+        Creates inflated versions of all obstacles.
+        
+        Returns:
+            List of inflated obstacles
+        """
+        return [obstacle.inflate(self.inflation) for obstacle in self.obstacles]
 
     def convert_to_display(self, point: Tuple[float, float]) -> Tuple[int, int]:
         """
@@ -338,35 +344,68 @@ class Visualizer:
             'reference_path': (255, 165, 0),
             'actual_path': (255, 0, 0),
             'reference': (0, 255, 0),
-            'actual': (255, 0, 0)
+            'actual': (255, 0, 0),
+            'inflated_obstacle': (128, 128, 128),
+            'alternative_goal': (255, 100, 100)
         }
 
         self.debug_helper = DebugHelper(debug=True)
 
-    def display_world(self, goal: Tuple[float, float]) -> None:
+    def display_world(self, is_alternative: bool, goal: Tuple[float, float]) -> None:
         """
         Renders the goal position and obstacles in the world.
         """
-        self.display_goal(goal)
+        self.display_goal(is_alternative, goal)
         self.display_obstacles()
 
-    def display_goal(self, goal: Tuple[float, float]) -> None:
+    def display_goal(self, is_alternative: bool, goal: Tuple[float, float]) -> None:
+        
         goal = self.world.convert_to_display(goal)
-        pygame.draw.circle(self.screen, self.colors['goal'], goal, 6)
+        pygame.draw.circle(self.screen, self.colors['alternative_goal'], goal, 6)
+        if is_alternative:
+            goal = self.world.convert_to_display(goal)
+            pygame.draw.circle(self.screen, self.colors['goal'], goal, 6)
 
     def display_obstacles(self) -> None:
+        # First draw inflated obstacles with transparency
+        for obstacle in self.world.inflated_obstacles:
+            if obstacle.shape == 'circle':
+                # Circle handling remains the same
+                size = int(obstacle.size * 2)
+                surf = pygame.Surface((size, size), pygame.SRCALPHA)
+                position = (size//2, size//2)
+                pygame.draw.circle(surf, (*self.colors['inflated_obstacle'], 128), position, int(obstacle.size))
+                screen_pos = self.world.convert_to_display(obstacle.position)
+                self.screen.blit(surf, (screen_pos[0] - size//2, screen_pos[1] - size//2))
+                
+            elif obstacle.shape == 'rectangle':
+                width, height = obstacle.size
+                # Calculate left coordinate
+                left = self.world.robot_origin[0] + obstacle.position[0]
+                # Calculate top coordinate using the provided formula
+                top = self.world.robot_origin[1] - (obstacle.position[1] + height)
+                
+                # Create transparent rectangle
+                surf = pygame.Surface((int(width), int(height)), pygame.SRCALPHA)
+                pygame.draw.rect(surf, (*self.colors['inflated_obstacle'], 128), surf.get_rect())
+                self.screen.blit(surf, (left, top))
+
+        # Then draw original obstacles (solid)
         for obstacle in self.world.obstacles:
             if obstacle.shape == 'circle':
                 position = self.world.convert_to_display(obstacle.position)
                 pygame.draw.circle(self.screen, self.colors['obstacle'], position, int(obstacle.size))
             elif obstacle.shape == 'rectangle':
                 width, height = obstacle.size
-                # Compute display coordinates for the top-left corner
+                # Calculate left coordinate
                 left = self.world.robot_origin[0] + obstacle.position[0]
+                # Calculate top coordinate using the provided formula
                 top = self.world.robot_origin[1] - (obstacle.position[1] + height)
+                
                 rect = pygame.Rect(left, top, width, height)
                 pygame.draw.rect(self.screen, self.colors['obstacle'], rect)
 
+    
     def display_robot(self, robot: Robot) -> None:
         """
         Renders the robot, including joints and links.
@@ -421,7 +460,10 @@ class Visualizer:
                 return False
 
         self.screen.fill(self.colors['background'])
-        self.display_world(goal)
+        if controller.is_alternative:
+            self.display_world(controller.is_alternative, controller.alternative_goal)
+        else:
+            self.display_world(controller.is_alternative, goal)
         if controller is not None:
             self.display_paths(robot, controller)
         self.display_robot(robot)
@@ -940,7 +982,7 @@ class GridBasedPlanner(Planner):
 
     def _get_min_obstacle_distance(self, pos: Tuple[float, float]) -> float:
         min_dist = float('inf')
-        for obstacle in self.world.obstacles:
+        for obstacle in self.world.inflated_obstacles:
             if obstacle.shape == 'circle':
                 dist = np.hypot(pos[0] - obstacle.position[0], 
                               pos[1] - obstacle.position[1]) - obstacle.size
@@ -1021,7 +1063,7 @@ class GridBasedPlanner(Planner):
 
     def check_obstacle_collision(self, theta_0: float, theta_1: float) -> bool:
         link_segments = self.robot.compute_link_segments(theta_0, theta_1)
-        for obstacle in self.world.obstacles:
+        for obstacle in self.world.inflated_obstacles:
             for segment in link_segments:
                 if self.robot_collision(segment, obstacle):
                     return True
@@ -3415,7 +3457,7 @@ class MPCController:
         self.path = []  # Store reference path
         self.path_index = 0  # Current path index
 
-        self.debug_helper = DebugHelper(debug=True)
+        self.debug_helper = DebugHelper(debug=False)
         
         # Compute controller gains based on provided equations
         self.k1 = 2 / (self.h**2 + 4*self.get_rho())
@@ -3634,6 +3676,9 @@ class Controller:
         self.path: List[State] = []
         self.coarse_path: List[State] = []
         self.path_index = 0
+        self.alternative_goal = None
+        self.is_alternative = False
+
         # Initialize MPC controller
         self.mpc = MPCController(None, robot.constants)  # Robot will be set in set_goal
         
@@ -3664,83 +3709,95 @@ class Controller:
         self.debug_helper.log_state(f"Setting new goal: {goal}, final velocities: {final_velocities}")
         
         start_pos = robot.joint_2_pos()
+        goal_theta = robot.inverse_kinematics(*goal)
+        goal_state = State(goal_theta[0], goal_theta[1], 0.0, 0.0)
         self.goal = goal
-
+        self.alternative_goal = goal
+        
+        
+        # Check if goal is obstructed
+        coarse_path = []
+        if self.planner.is_collision(goal_state):
+            self.debug_helper.log_state("Goal position is obstructed, searching for nearest valid goal...")
+            
+            # Define search parameters for alternative goals
+            search_radius = 2.0  # Initial search radius
+            angle_steps = 16  # Number of directions to search
+            max_search_radius = 100.0  # Maximum search radius
+            radius_increment = 3.0  # How much to increase radius in each iteration
+            
+            valid_goals = []
+            
+            while search_radius <= max_search_radius:
+                for i in range(angle_steps):
+                    angle = (2 * np.pi * i) / angle_steps
+                    # Search in a circular pattern around the original goal
+                    offset_x = search_radius * np.cos(angle)
+                    offset_y = search_radius * np.sin(angle)
+                    
+                    alternative_goal = (goal[0] + offset_x, goal[1] + offset_y)
+                    alternative_goal_theta = robot.inverse_kinematics(*alternative_goal)
+                    alternative_goal_state = State(alternative_goal_theta[0], alternative_goal_theta[1], 0.0, 0.0)
+    
+                    
+                    # Check if this alternative position is valid
+                    if not self.planner.is_collision(alternative_goal_state):
+                        # Store valid goal and its distance from original goal
+                        distance = np.hypot(offset_x, offset_y)
+                        valid_goals.append((alternative_goal, distance))
+                
+                if valid_goals:
+                    break
+                    
+                search_radius += radius_increment
+            
+            if not valid_goals:
+                self.debug_helper.log_state("No valid alternative goals found")
+                raise ValueError("Goal is obstructed and no valid alternative positions found")
+            
+            # Sort valid goals by distance from original goal
+            valid_goals.sort(key=lambda x: x[1])
+            
+            # Try planning to each valid goal in order until we find a valid path
+            for alternative_goal, distance in valid_goals:
+                try:
+                    self.debug_helper.log_state(f"Attempting to plan to alternative goal: {alternative_goal}")
+                    goal = alternative_goal  # Update goal to alternative position
+                    coarse_path = self.planner.Plan(start_pos, alternative_goal, final_velocities)
+                    if coarse_path:
+                        self.alternative_goal = alternative_goal
+                        self.is_alternative  = True
+                        self.debug_helper.log_state(f"Found valid path to alternative goal at distance {distance}")
+                        break
+                except Exception as e:
+                    continue
+            else:
+                raise ValueError("Could not find valid path to any alternative goal position")
+        
         # Update robot reference in MPC controller
         self.mpc.robot = robot
+
+        # Initialize the trajectory planner
+        trajectory_planner = TimeOptimalTrajectoryGenerator(robot, coarse_path)
         
-        # Get path from planner
-        try:
-            self.debug_helper.log_state("About to run planner:")
-            coarse_path = self.planner.Plan(start_pos, goal, final_velocities)
-            self.debug_helper.print_path_stats(coarse_path, robot)
-            self.debug_helper.validate_path_limits(coarse_path, robot)
-            self.debug_helper.print_path_points(coarse_path)
-            self.coarse_path = coarse_path
-            
-            # Generate trajectory from path
-            # Initialize the planner
-            trajectory_planner = TimeOptimalTrajectoryGenerator(robot, coarse_path)
-            
-            # Generate optimal trajectory
-            path = trajectory_planner.generate_trajectory(coarse_path)
-            self.debug_helper.print_trajectory_stats(path, robot)
-            self.debug_helper.validate_trajectory_dynamics(path, robot)
-            self.debug_helper.print_trajectory_points(path, robot)
-            
-            if not path:
-                raise ValueError("No valid path found")
+        # Generate optimal trajectory
+        path = trajectory_planner.generate_trajectory(coarse_path)
+        self.debug_helper.print_trajectory_stats(path, robot)
+        self.debug_helper.validate_trajectory_dynamics(path, robot)
+        self.debug_helper.print_trajectory_points(path, robot)
 
-            # # Validate path continuity
-            # for i in range(1, len(path)):
-            #     delta_theta0 = abs(path[i].theta_0 - path[i-1].theta_0)
-            #     delta_theta1 = abs(path[i].theta_1 - path[i-1].theta_1)
-            #     if delta_theta0 > 0.1 or delta_theta1 > 0.1:
-            #         self.debug_helper.log_state(f"Warning: Large path discontinuity at index {i}")
-            
-            # # Extract reference trajectories with validation
-            # self.reference_theta_0 = []
-            # self.reference_theta_1 = []
-            # self.reference_omega_0 = []
-            # self.reference_omega_1 = []
-            # self.reference_alpha_0: List[float] = []
-            # self.reference_alpha_1: List[float] = []
-
-            # dt = self.constants.DT
-            # for i in range(1, len(path)):
-            #     if (abs(path[i].theta_0) <= self.constants.JOINT_LIMITS[1] and
-            #         abs(path[i].theta_1) <= self.constants.JOINT_LIMITS[1]):
-            #         self.reference_theta_0.append(path[i].theta_0)
-            #         self.reference_theta_1.append(path[i].theta_1)
-            #         self.reference_omega_0.append(path[i].omega_0)
-            #         self.reference_omega_1.append(path[i].omega_1)
-
-            #         # Compute accelerations from velocity differences
-            #         if i < len(path) - 1:
-            #             alpha_0 = (path[i+1].omega_0 - path[i].omega_0) / dt
-            #             alpha_1 = (path[i+1].omega_1 - path[i].omega_1) / dt
-            #         else:
-            #             alpha_0 = 0.0  # Zero acceleration for final point
-            #             alpha_1 = 0.0
-                    
-            #         self.reference_alpha_0.append(alpha_0)
-            #         self.reference_alpha_1.append(alpha_1)
-            #     else:
-            #         self.debug_helper.log_state(f"Skipping invalid state: {path[i]}")
-                    
-            self.path = path
-            self.mpc.set_path(path)
-            self.path_index = 0
-            
-            # Reset controller states
-            self._reset_controller_states()
-            
-            self.debug_helper.log_state("Goal setting completed successfully")
-            self.debug_helper.analyze_path_tracking(self, robot)
-            
-        except Exception as e:
-            self.debug_helper.log_state(f"Error in goal setting: {str(e)}")
-            raise
+        if not path:
+            raise ValueError("No valid path found")
+                
+        self.path = path
+        self.mpc.set_path(path)
+        self.path_index = 0
+        
+        # Reset controller states
+        self._reset_controller_states()
+        
+        self.debug_helper.log_state("Goal setting completed successfully")
+        self.debug_helper.analyze_path_tracking(self, robot)
 
     def step(self, robot: Robot) -> Robot:
         """Execute one control step"""

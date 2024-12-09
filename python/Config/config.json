@@ -49,7 +49,7 @@
         "colors": {
             "background": [255, 255, 255],
             "robot": [0, 0, 0],
-            "goal": [255, 0, 0],
+            "goal": [255, 50, 50],
             "obstacle": [0, 0, 0],
             "success_text": [0, 128, 0]
         }
