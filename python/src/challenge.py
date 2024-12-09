@@ -126,7 +126,7 @@ class Robot:
         self.I1 = self.m1 * constants.LINK_1**2 / 12  # Inertia of link 1
         self.I2 = self.m2 * constants.LINK_2**2 / 12  # Inertia of link 2
 
-        self.debug_helper = DebugHelper(debug=True)
+        self.debug_helper = DebugHelper(debug=False)
 
     @property
     def theta_0(self) -> float:
@@ -292,7 +292,7 @@ class World:
         self.robot_origin = robot_origin
         self.obstacles = obstacles if obstacles is not None else []
 
-        self.debug_helper = DebugHelper(debug=True)
+        self.debug_helper = DebugHelper(debug=False)
 
         # Create inflated versions of obstacles
         self.inflation = 5
@@ -449,7 +449,7 @@ class Visualizer:
             if len(actual_points) > 1:
                 pygame.draw.lines(self.screen, self.colors['actual_path'], False, actual_points, 2)
 
-    def update_display(self, robot: Robot, success: bool, goal: Tuple[float, float], controller: Optional['Controller'] = None) -> bool:
+    def update_display(self, robot: Robot, success: bool, goal: Tuple[float, float], is_moving_goal, controller: Optional['Controller'] = None) -> bool:
         """
         Updates the display with the latest robot and world states.
         """
@@ -467,6 +467,11 @@ class Visualizer:
         if controller is not None:
             self.display_paths(robot, controller)
         self.display_robot(robot)
+
+        if is_moving_goal:
+            moving_goal_text = self.font.render("Goal Changed, Planning new Goal!", True, self.colors['success_text'])
+            text_rect = moving_goal_text.get_rect(center=(self.world.width // 4, 30))
+            self.screen.blit(moving_goal_text, text_rect)
 
         if success:
             success_text = self.font.render("Goal Reached Successfully!", True, self.colors['success_text'])
@@ -1122,7 +1127,7 @@ class AStarPlanner(GridBasedPlanner):
         self.jerk_weight = 0.2  # Weight for jerk cost
         
         # Add debug helper
-        self.debug_helper = DebugHelper(debug=True)
+        self.debug_helper = DebugHelper(debug=False)
 
 
 
@@ -1833,14 +1838,14 @@ class AStarPlanner(GridBasedPlanner):
         try:
             # First try coarse planning
             self.set_mode('coarse')
-            coarse_path = self.plan(start, goal, robot)
+            coarse_path = self.plan(start, goal, self.robot)
 
             if not coarse_path:
                 self.debug_helper.log_state("Coarse planning failed, attempting kinodynamic planning")
                 self.set_mode('kinodynamic')
-                path = plan(start, goal, robot, final_velocities)
-                self.debug_helper.print_path_stats(path, robot)
-                self.debug_helper.validate_path_limits(path, robot)
+                path = self.plan(start, goal, self.robot, final_velocities)
+                self.debug_helper.print_path_stats(path, self.robot)
+                self.debug_helper.validate_path_limits(path, self.robot)
                 self.debug_helper.print_path_points(path)
                 return path
                 
@@ -1848,8 +1853,8 @@ class AStarPlanner(GridBasedPlanner):
             self.set_mode('kinodynamic')            
             if self.best_distance_to_goal < 2.0:
                 self.debug_helper.log_state("Successfully coarse path")
-                self.debug_helper.print_path_stats(coarse_path, robot)
-                self.debug_helper.validate_path_limits(coarse_path, robot)
+                self.debug_helper.print_path_stats(coarse_path, self.robot)
+                self.debug_helper.validate_path_limits(coarse_path, self.robot)
                 self.debug_helper.print_path_points(coarse_path)
                 return coarse_path
             else:
@@ -1866,9 +1871,9 @@ class AStarPlanner(GridBasedPlanner):
                     velocities = (getattr(intermediate_state, 'velocity_0', 0.0),
                                 getattr(intermediate_state, 'velocity_1', 0.0))
                     
-                    path = self.plan(goal, new_goal, robot, velocities)
+                    path = self.plan(goal, new_goal, self.robot, velocities)
                     self.debug_helper.log_state(f"Planner found connection path with distance to goal: {self.best_distance_to_goal:.3f}")
-                    if path and self.best_distance_to_goal < 0.3:
+                    if path: # and self.best_distance_to_goal < 1.5:
                         path.reverse()
                         path_final = []
                         # Use proper indexing for coarse path
@@ -1876,7 +1881,7 @@ class AStarPlanner(GridBasedPlanner):
                         path_final = coarse_path[:split_index]
                         path_final.extend(path)
                         
-                        self.debug_helper.print_path_stats(path_final, robot)
+                        self.debug_helper.print_path_stats(path_final, self.robot)
                         self.debug_helper.print_path_points(path_final)
                         return path_final
                         
@@ -2242,8 +2247,8 @@ class AStarPlanner(GridBasedPlanner):
         
         try:
             # Get goal configuration
-            goal_theta = robot.inverse_kinematics(*goal)
-            start_theta = robot.inverse_kinematics(*start)
+            goal_theta = self.robot.inverse_kinematics(*goal)
+            start_theta = self.robot.inverse_kinematics(*start)
             
             # Create start and goal states
             if self.mode == 'kinodynamic':
@@ -2271,7 +2276,7 @@ class AStarPlanner(GridBasedPlanner):
                     # Return best path found so far
                     return self.reconstruct_path(came_from, open_set[0][2])
                 
-                current_pos = robot.forward_kinematics(current_state.theta_0, current_state.theta_1)
+                current_pos = self.robot.forward_kinematics(current_state.theta_0, current_state.theta_1)
                 current_distance = np.hypot(current_pos[0] - goal[0], current_pos[1] - goal[1])
                 
                 if current_distance < self.best_distance_to_goal:
@@ -3542,7 +3547,7 @@ class MPCController:
         
         return control_sequence
 
-    def step(self, theta_ref: Tuple[float, float], robot) -> Tuple[float, float]:
+    def step(self, theta_ref: Tuple[float, float], robot, is_moving_goal: bool) -> Tuple[float, float]:
         """Execute one control step"""
         self.debug_helper.log_state("\n=== MPC Step Execution ===")
 
@@ -3574,6 +3579,7 @@ class MPCController:
                 reference_trajectory.append((ref_state.theta_0, ref_state.theta_1))
                 self.debug_helper.log_state(f"Reference point {i}: θ0={ref_state.theta_0:.3f}, θ1={ref_state.theta_1:.3f}")
         # Optimize control sequence
+        
         control_sequence = self.optimize_control_sequence(current_state, reference_trajectory, steps_in_horizon)
 
 
@@ -3584,7 +3590,11 @@ class MPCController:
         #     if abs(v[0]) > min_control or abs(v[1]) > min_control:
         #         selected_control = v
         #         break
-        v = control_sequence[0]
+        ref_state = self.path[current_path_index]
+        if is_moving_goal and (current_path_index > 10 and ref_state.omega_0 == 0.0 and ref_state.omega_1 == 0.0):
+            v = 0.0
+        else:
+            v = control_sequence[0]
         # # If all controls are zero, use the control for the next reference point
         # if not selected_control and len(control_sequence) > 1:
         #     selected_control = control_sequence[1]
@@ -3678,6 +3688,12 @@ class Controller:
         self.path_index = 0
         self.alternative_goal = None
         self.is_alternative = False
+        self.stopping_mode = False
+        self.stop_start_index = None
+        self.stop_distance = None
+        self.current_velocity = 0.0
+        self.planning_timeout = 500.0
+        self.is_moving_goal = False
 
         # Initialize MPC controller
         self.mpc = MPCController(None, robot.constants)  # Robot will be set in set_goal
@@ -3701,103 +3717,227 @@ class Controller:
         
         
         # Add debug helper
-        self.debug_helper = DebugHelper(debug=True)
+        self.debug_helper = DebugHelper(debug=False)
+
+    def initiate_graceful_stop(self, robot: Robot) -> None:
+        """Initiate graceful stop by calculating stop distance and preparing trajectory"""
+        # Calculate current end effector velocity
+        self.debug_helper.log_state("starting graceful_stop")
+        self.current_velocity = np.hypot(robot.omega_0, robot.omega_1)
+        self.is_moving_goal = True
+        
+        # Calculate stop distance using v^2/(2*a)
+        self.stop_distance = (self.current_velocity ** 2) / (2 * 0.85 * self.constants.MAX_ACCELERATION)
+        
+        # Mark current position in trajectory
+        self.stop_start_index = self.path_index
+        
+        # Calculate how many points we need in the trajectory to cover stop distance
+        current_pos = robot.joint_2_pos()
+        points_covered = 0
+        accumulated_distance = 0
+        
+        for i in range(self.stop_start_index, len(self.path)):
+            next_pos = robot.forward_kinematics(
+                self.path[i].theta_0,
+                self.path[i].theta_1
+            )
+            accumulated_distance += np.hypot(
+                next_pos[0] - current_pos[0],
+                next_pos[1] - current_pos[1]
+            )
+            if accumulated_distance >= self.stop_distance:
+                points_covered = i - self.stop_start_index + 1
+                break
+            current_pos = next_pos
+
+        self.debug_helper.log_state(f"stop_distance{self.stop_distance}, points_covered: {points_covered}")
+        
+        # Override velocities in the trajectory for stopping distance
+        self._override_trajectory_velocities(max(points_covered, 1))
+        self.stopping_mode = True
+        self.debug_helper.log_state("Velocity is overriden")
+
+    def _override_trajectory_velocities(self, points_to_stop: int) -> None:
+        """Override trajectory velocities to achieve graceful stop"""
+        if points_to_stop == 0:
+            return
+            
+        # Calculate deceleration per point
+        decel_per_point = self.current_velocity / points_to_stop
+        
+        # Get current velocities at stop start
+        start_omega_0 = self.path[self.stop_start_index].omega_0
+        start_omega_1 = self.path[self.stop_start_index].omega_1
+        
+        # Scale factor for each joint based on their contribution to end effector velocity
+        total_omega = abs(start_omega_0) + abs(start_omega_1)
+        if total_omega != 0:
+            scale_0 = abs(start_omega_0) / total_omega
+            scale_1 = abs(start_omega_1) / total_omega
+        else:
+            scale_0 = scale_1 = 0.5
+
+        # Create new path with modified velocities
+        new_path = []
+        
+        # Copy states up to stop_start_index
+        for i in range(self.stop_start_index):
+            new_path.append(self.path[i])
+        
+        # Override velocities with linear deceleration
+        for i in range(points_to_stop):
+            index = self.stop_start_index + i
+            if index >= len(self.path):
+                break
+                
+            # Calculate velocity scale for this point (1.0 -> 0.0)
+            vel_scale = 1.0 - (i / points_to_stop)
+            
+            # Create new state with scaled velocities but same positions
+            old_state = self.path[index]
+            new_state = State(
+                theta_0=old_state.theta_0,
+                theta_1=old_state.theta_1,
+                omega_0=start_omega_0 * vel_scale,
+                omega_1=start_omega_1 * vel_scale
+            )
+            new_path.append(new_state)
+
+        # Set remaining trajectory points to zero velocity
+        for i in range(self.stop_start_index + points_to_stop, len(self.path)):
+            old_state = self.path[i]
+            new_state = State(
+                theta_0=old_state.theta_0,
+                theta_1=old_state.theta_1,
+                omega_0=0.0,
+                omega_1=0.0
+            )
+            new_path.append(new_state)
+
+        # Update the path with new states
+        self.path = new_path
+        
+        # Make sure MPC controller uses the new path
+        self.mpc.set_path(new_path)
 
     def set_goal(self, robot: Robot, goal: Tuple[float, float], final_velocities: Tuple[float, float] = (0.0, 0.0)) -> None:
         """Set a new goal and plan path"""
         self.debug_helper.print_controller_header()
-        self.debug_helper.log_state(f"Setting new goal: {goal}, final velocities: {final_velocities}")
-        
-        start_pos = robot.joint_2_pos()
-        goal_theta = robot.inverse_kinematics(*goal)
-        goal_state = State(goal_theta[0], goal_theta[1], 0.0, 0.0)
-        self.goal = goal
-        self.alternative_goal = goal
-        
-        
-        # Check if goal is obstructed
-        coarse_path = []
-        if self.planner.is_collision(goal_state):
-            self.debug_helper.log_state("Goal position is obstructed, searching for nearest valid goal...")
+        self.planning_mode = True
+        self.plan_start_time = time.time()
+        self.debug_helper.log_state(f"Starting path planning to goal: {goal}")
+        try:    
+            start_pos = robot.joint_2_pos()
+            goal_theta = robot.inverse_kinematics(*goal)
+            goal_state = State(goal_theta[0], goal_theta[1], 0.0, 0.0)
+            self.goal = goal
+            self.alternative_goal = goal
             
-            # Define search parameters for alternative goals
-            search_radius = 2.0  # Initial search radius
-            angle_steps = 16  # Number of directions to search
-            max_search_radius = 100.0  # Maximum search radius
-            radius_increment = 3.0  # How much to increase radius in each iteration
             
-            valid_goals = []
-            
-            while search_radius <= max_search_radius:
-                for i in range(angle_steps):
-                    angle = (2 * np.pi * i) / angle_steps
-                    # Search in a circular pattern around the original goal
-                    offset_x = search_radius * np.cos(angle)
-                    offset_y = search_radius * np.sin(angle)
-                    
-                    alternative_goal = (goal[0] + offset_x, goal[1] + offset_y)
-                    alternative_goal_theta = robot.inverse_kinematics(*alternative_goal)
-                    alternative_goal_state = State(alternative_goal_theta[0], alternative_goal_theta[1], 0.0, 0.0)
-    
-                    
-                    # Check if this alternative position is valid
-                    if not self.planner.is_collision(alternative_goal_state):
-                        # Store valid goal and its distance from original goal
-                        distance = np.hypot(offset_x, offset_y)
-                        valid_goals.append((alternative_goal, distance))
+            # Check if goal is obstructed
+            self.debug_helper.log_state("About to run planner:")
+            coarse_path = self.planner.Plan(start_pos, goal, final_velocities)
+            self.debug_helper.print_path_stats(coarse_path, robot)
+            self.debug_helper.validate_path_limits(coarse_path, robot)
+            self.debug_helper.print_path_points(coarse_path)
+            self.coarse_path = coarse_path
+            # if self.planner.is_collision(goal_state):
+            #     self.debug_helper.log_state("Goal position is obstructed, searching for nearest valid goal...")
                 
-                if valid_goals:
-                    break
-                    
-                search_radius += radius_increment
-            
-            if not valid_goals:
-                self.debug_helper.log_state("No valid alternative goals found")
-                raise ValueError("Goal is obstructed and no valid alternative positions found")
-            
-            # Sort valid goals by distance from original goal
-            valid_goals.sort(key=lambda x: x[1])
-            
-            # Try planning to each valid goal in order until we find a valid path
-            for alternative_goal, distance in valid_goals:
-                try:
-                    self.debug_helper.log_state(f"Attempting to plan to alternative goal: {alternative_goal}")
-                    goal = alternative_goal  # Update goal to alternative position
-                    coarse_path = self.planner.Plan(start_pos, alternative_goal, final_velocities)
-                    if coarse_path:
-                        self.alternative_goal = alternative_goal
-                        self.is_alternative  = True
-                        self.debug_helper.log_state(f"Found valid path to alternative goal at distance {distance}")
-                        break
-                except Exception as e:
-                    continue
-            else:
-                raise ValueError("Could not find valid path to any alternative goal position")
-        
-        # Update robot reference in MPC controller
-        self.mpc.robot = robot
-
-        # Initialize the trajectory planner
-        trajectory_planner = TimeOptimalTrajectoryGenerator(robot, coarse_path)
-        
-        # Generate optimal trajectory
-        path = trajectory_planner.generate_trajectory(coarse_path)
-        self.debug_helper.print_trajectory_stats(path, robot)
-        self.debug_helper.validate_trajectory_dynamics(path, robot)
-        self.debug_helper.print_trajectory_points(path, robot)
-
-        if not path:
-            raise ValueError("No valid path found")
+            #     # Define search parameters for alternative goals
+            #     search_radius = 2.0  # Initial search radius
+            #     angle_steps = 16  # Number of directions to search
+            #     max_search_radius = 100.0  # Maximum search radius
+            #     radius_increment = 3.0  # How much to increase radius in each iteration
                 
-        self.path = path
-        self.mpc.set_path(path)
-        self.path_index = 0
+            #     valid_goals = []
+                
+            #     while search_radius <= max_search_radius:
+            #         for i in range(angle_steps):
+            #             angle = (2 * np.pi * i) / angle_steps
+            #             # Search in a circular pattern around the original goal
+            #             offset_x = search_radius * np.cos(angle)
+            #             offset_y = search_radius * np.sin(angle)
+                        
+            #             alternative_goal = (goal[0] + offset_x, goal[1] + offset_y)
+            #             alternative_goal_theta = robot.inverse_kinematics(*alternative_goal)
+            #             alternative_goal_state = State(alternative_goal_theta[0], alternative_goal_theta[1], 0.0, 0.0)
         
-        # Reset controller states
-        self._reset_controller_states()
-        
-        self.debug_helper.log_state("Goal setting completed successfully")
-        self.debug_helper.analyze_path_tracking(self, robot)
+                        
+            #             # Check if this alternative position is valid
+            #             if not self.planner.is_collision(alternative_goal_state):
+            #                 # Store valid goal and its distance from original goal
+            #                 distance = np.hypot(offset_x, offset_y)
+            #                 valid_goals.append((alternative_goal, distance))
+                    
+            #         if valid_goals:
+            #             break
+                        
+            #         search_radius += radius_increment
+                
+            #     if not valid_goals:
+            #         self.debug_helper.log_state("No valid alternative goals found")
+            #         raise ValueError("Goal is obstructed and no valid alternative positions found")
+                
+            #     # Sort valid goals by distance from original goal
+            #     valid_goals.sort(key=lambda x: x[1])
+                
+            #     # Try planning to each valid goal in order until we find a valid path
+            #     for alternative_goal, distance in valid_goals:
+            #         try:
+            #             self.debug_helper.log_state(f"Attempting to plan to alternative goal: {alternative_goal}")
+            #             goal = alternative_goal  # Update goal to alternative position
+            #             coarse_path = self.planner.Plan(start_pos, alternative_goal, final_velocities)
+            #             if coarse_path:
+            #                 self.alternative_goal = alternative_goal
+            #                 self.is_alternative  = True
+            #                 self.debug_helper.log_state(f"Found valid path to alternative goal at distance {distance}")
+            #                 break
+            #         except Exception as e:
+            #             continue
+            #     else:
+            #         raise ValueError("Could not find valid path to any alternative goal position")
+            
+            # Update robot reference in MPC controller
+            self.mpc.robot = robot
+
+            # Initialize the trajectory planner
+            trajectory_planner = TimeOptimalTrajectoryGenerator(robot, coarse_path)
+            
+            # Generate optimal trajectory
+            path = trajectory_planner.generate_trajectory(coarse_path)
+            self.debug_helper.print_trajectory_stats(path, robot)
+            self.debug_helper.validate_trajectory_dynamics(path, robot)
+            self.debug_helper.print_trajectory_points(path, robot)
+
+            if not path:
+                self.debug_helper.log_state("Failed to generate trajectory")
+                self.planning_mode = False
+                return False
+                    
+            self.path = path
+            self.mpc.set_path(path)
+            self.path_index = 0
+            
+            # Reset controller states
+            self._reset_controller_states()
+            
+            self.debug_helper.log_state("Goal setting completed successfully")
+            self.debug_helper.analyze_path_tracking(self, robot)
+            self.planning_mode = False
+            return True
+        except Exception as e:
+                self.debug_helper.log_state(f"Error in path planning: {str(e)}")
+                self.planning_mode = False
+                return False
+
+    def is_planning_timeout(self) -> bool:
+        """Check if path planning has exceeded timeout"""
+        if self.planning_mode and self.plan_start_time:
+            return (time.time() - self.plan_start_time) > self.planning_timeout
+            self.debug_helper.log_state("Planning Timeout!")
+        return False
 
     def step(self, robot: Robot) -> Robot:
         """Execute one control step"""
@@ -3810,7 +3950,7 @@ class Controller:
             theta_ref = (ref_state.theta_0, ref_state.theta_1)
             
             # Compute control action using MPC
-            tau_0, tau_1 = self.mpc.step(theta_ref, robot)
+            tau_0, tau_1 = self.mpc.step(theta_ref, robot, self.is_moving_goal)
             
             # Apply torques and update robot state
             alpha_0, alpha_1 = robot.forward_dynamics(
@@ -4600,11 +4740,12 @@ class PathParameterizer:
         
         return PathPoint(s, theta_0, theta_1, dtheta_0, dtheta_1, ddtheta_0, ddtheta_1)
 
-class SimpleAStarPlanner:
+class SimpleAStarPlanner(GridBasedPlanner):
     """
     A simplified A* planner for 2-link robotic arm path planning.
     """
     def __init__(self, robot, world):
+        super().__init__(robot, world)
         self.robot = robot
         self.world = world
         self.constants = robot.constants
@@ -4795,28 +4936,7 @@ class SimpleAStarPlanner:
         limits = self.constants.JOINT_LIMITS
         return (limits[0] <= theta_0 <= limits[1] and
                 limits[0] <= theta_1 <= limits[1])
-                
-    def is_collision(self, state: State) -> bool:
-        """Check if state results in collision."""
-        # Check cache first
-        if state in self.collision_cache:
-            return self.collision_cache[state]
-            
-        # Check self collision
-        if self.robot.self_collision(state.theta_0, state.theta_1):
-            self.collision_cache[state] = True
-            return True
-            
-        # Check obstacle collisions
-        segments = self.robot.compute_link_segments(state.theta_0, state.theta_1)
-        for obstacle in self.world.obstacles:
-            for segment in segments:
-                if self.check_segment_collision(segment, obstacle):
-                    self.collision_cache[state] = True
-                    return True
-                    
-        self.collision_cache[state] = False
-        return False
+
         
     def check_segment_collision(self, segment: tuple, obstacle) -> bool:
         """Check collision between a line segment and an obstacle."""
@@ -5707,39 +5827,105 @@ class Runner:
         self.controller = controller
         self.world = world
         self.visualizer = visualizer
+        self.debug_helper = DebugHelper(True)
         self.constants = robot.constants
         self.goal = generate_random_goal(
             self.constants.min_reachable_radius(),
             self.constants.max_reachable_radius()
         )
         self.final_velocities = (0.0, 0.0)  # Default final velocities
+        self.goal_change_received = False
+        self.new_goal = None
+        self.max_planning_attempts = 3  # Maximum number of planning attempts
+        self.planning_attempt_delay = 0.5  # Delay between planning attempts (seconds)
+        self.is_moving_goal  = True
+
+    def wait_for_planning(self) -> bool:
+        """Wait for path planning to complete with timeout and retries"""
+        attempts = 0
+        while attempts < self.max_planning_attempts:
+            # Wait for current planning attempt to complete or timeout
+            while self.controller.planning_mode:
+                if self.controller.is_planning_timeout():
+                    self.debug_helper.log_state(f"Planning attempt {attempts + 1} timed out")
+                    break
+                time.sleep(0.1)  # Small sleep to prevent CPU hogging
+                
+                # Update visualization during planning
+                self.visualizer.update_display(self.robot, False, self.goal, True, controller=self.controller)
+
+            # If planning was successful, return True
+            if self.controller.path and not self.controller.planning_mode:
+                return True
+
+            # If we haven't exceeded max attempts, try again
+            attempts += 1
+            if attempts < self.max_planning_attempts:
+                self.debug_helper.log_state(f"Retrying path planning (attempt {attempts + 1}/{self.max_planning_attempts})")
+                time.sleep(self.planning_attempt_delay)
+                if not self.controller.set_goal(self.robot, self.new_goal, self.final_velocities):
+                    continue
+
+        self.debug_helper.log_state("Failed to find valid path after all attempts")
+        return False
 
     def run(self) -> None:
-        """
-        Main simulation loop. Steps the controller and updates visualization.
-        """
+        """Main simulation loop with support for goal changes"""
         running = True
-        self.controller.set_goal(self.robot, self.goal, final_velocities=self.final_velocities)
+        if not self.controller.set_goal(self.robot, self.goal, final_velocities=self.final_velocities):
+            raise ValueError("Initial path planning failed")
+
+
+        # Simulate receiving a goal change after random time
+        is_moving_goal = self.is_moving_goal
+        goal_change_time = time.time() + 1.0
+        last_time = goal_change_time
         while running:
-            self.robot = self.controller.step(self.robot)
-            success = self.check_success(self.robot, self.goal)
-            self.visualizer.update_display(self.robot, success, self.goal, controller=self.controller)
-            # if success:
-            #     running = False
-            #     # Optionally, change final velocities for the next goal
-            #     # For example, alternate between stopping and maintaining velocity
-            #     # Here, we'll keep it simple and always set to zero
-            #     self.final_velocities = (0.0, 0.0)
-                
-            #     # Generate a new random goal
-            #     self.goal = generate_random_goal(
-            #         self.constants.min_reachable_radius(),
-            #         self.constants.max_reachable_radius()
-            #     )
-            #     self.controller.set_goal(self.robot, self.goal, final_velocities=self.final_velocities)
+            current_time = time.time()
+            # Simulate receiving goal change
+            if is_moving_goal and  current_time - goal_change_time > 0 and not self.goal_change_received:
+                # Signal controller to start graceful stop
+                self.debug_helper.log_state("initiateing gracefulstop")
+                self.controller.initiate_graceful_stop(self.robot)
+                # Generate new goal (simulated moving target)
+                self.new_goal = generate_random_goal(
+                    self.constants.min_reachable_radius(),
+                    self.constants.max_reachable_radius())
+                self.goal_change_received = True
+                self.debug_helper.log_state(f"current: {current_time} , goal_change_time: {goal_change_time},")
+            # Check if stop completed and need to switch to new goal
+            if is_moving_goal and self.goal_change_received and self.controller.stopping_mode:
+                self.debug_helper.log_state(f"Robot velocity, {self.robot.omega_0}, {self.robot.omega_1} ")
+                if abs(self.robot.omega_0) < 0.01 and abs(self.robot.omega_1) < 0.01:
+                    self.debug_helper.log_state("Robot stopped - planning path to new goal")
+                    
+                    # Start path planning to new goal
+                    self.goal = self.new_goal
+                    self.visualizer.update_display(self.robot, success, self.goal, True, controller=self.controller)
+                    if not self.controller.set_goal(self.robot, self.goal, final_velocities=self.final_velocities):
+                        self.debug_helper.log_state("Failed to set new goal")
+                        running = False
+                        break
+
+                    # Wait for path planning with timeout and retries
+                    # if not self.wait_for_planning():
+                    #     self.debug_helper.log_state("Failed to plan path to new goal")
+                    #     running = False
+                    #     break
+                    self.visualizer.update_display(self.robot, success, self.goal, False, controller=self.controller)
+                    self.debug_helper.log_state("Successfully planned path to new goal")
+                    self.goal_change_received = False
+                    current_time = time.time()
+                    goal_change_time = current_time + 1.0 # np.random.uniform(1.0, 1.5)
+            
+            # Normal control loop
+            if not self.controller.planning_mode:
+                self.robot = self.controller.step(self.robot)
+                success = self.check_success(self.robot, self.goal)
+                self.visualizer.update_display(self.robot, success, self.goal, False, controller=self.controller)
+            
             time.sleep(self.constants.DT)
 
-        # Add a pause before closing the visualizer
         pause = True
         while pause:
             for event in pygame.event.get():
@@ -5748,7 +5934,7 @@ class Runner:
                 elif event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE:
                     pause = False
             pygame.display.flip()
-            pygame.time.wait(100)  # Wait for 100 milliseconds
+            pygame.time.wait(100)
 
     @staticmethod
     def check_success(robot: Robot, goal: Tuple[float, float]) -> bool:
@@ -5799,11 +5985,10 @@ def main() -> None:
     # Generate a random rectangle obstacle and add it to the obstacles list
     workspace_size = min(config['world']['width'], config['world']['height'])
     min_distance = robot_constants.LINK_1  # For example, minimum distance is the length of the first link
-    random_rectangle_obstacle = generate_random_rectangle_obstacle(workspace_size, min_distance)
-    obstacles.append(random_rectangle_obstacle)
-    random_rectangle_obstacle = generate_random_rectangle_obstacle(workspace_size, min_distance)
-    obstacles.append(random_rectangle_obstacle)
-
+    # random_rectangle_obstacle = generate_random_rectangle_obstacle(workspace_size, min_distance)
+    # obstacles.append(random_rectangle_obstacle)
+    # random_rectangle_obstacle = generate_random_rectangle_obstacle(workspace_size, min_distance)
+    # obstacles.append(random_rectangle_obstacle)
     # Initialize world
     world = World(
         config['world']['width'],
