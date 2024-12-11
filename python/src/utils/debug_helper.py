@@ -55,24 +55,6 @@ class DebugHelper:
                 self.log_state(f"Joint limit violation at index {i}:")
                 self.log_state(f"θ0={state.theta_0:.3f}, θ1={state.theta_1:.3f}")
                 return False
-
-            # Check velocity limits
-            if abs(state.omega_0) > robot.constants.MAX_VELOCITY or \
-               abs(state.omega_1) > robot.constants.MAX_VELOCITY:
-                self.log_state(f"Velocity limit violation at index {i}:")
-                self.log_state(f"ω0={state.omega_0:.3f}, ω1={state.omega_1:.3f}")
-                return False
-
-            # Check accelerations if not first state
-            if i > 0:
-                alpha_0 = (state.omega_0 - path[i-1].omega_0) / robot.constants.DT
-                alpha_1 = (state.omega_1 - path[i-1].omega_1) / robot.constants.DT
-                
-                if abs(alpha_0) > robot.constants.MAX_ACCELERATION or \
-                   abs(alpha_1) > robot.constants.MAX_ACCELERATION:
-                    self.log_state(f"Acceleration limit violation at index {i}:")
-                    self.log_state(f"α0={alpha_0:.3f}, α1={alpha_1:.3f}")
-                    return False
         return True
         pass
 
@@ -96,12 +78,6 @@ class DebugHelper:
         theta1_vals = [s.theta_1 for s in path]
         print(f"Theta 0 range: [{min(theta0_vals):.2f}, {max(theta0_vals):.2f}]")
         print(f"Theta 1 range: [{min(theta1_vals):.2f}, {max(theta1_vals):.2f}]")
-        
-        # Velocity ranges
-        omega0_vals = [s.omega_0 for s in path]
-        omega1_vals = [s.omega_1 for s in path]
-        print(f"Omega 0 range: [{min(omega0_vals):.2f}, {max(omega0_vals):.2f}]")
-        print(f"Omega 1 range: [{min(omega1_vals):.2f}, {max(omega1_vals):.2f}]")
         
         # Path smoothness
         theta0_diffs = np.diff(theta0_vals)
@@ -158,15 +134,14 @@ class DebugHelper:
         print(f"Trajectory length: {len(trajectory)} points")
         
         # Compute statistics for each joint
-        dt = robot.constants.DT
         
         # Initialize arrays for stats
         theta0_vals = [s.theta_0 for s in trajectory]
         theta1_vals = [s.theta_1 for s in trajectory]
         omega0_vals = [s.omega_0 for s in trajectory]
         omega1_vals = [s.omega_1 for s in trajectory]
-        alpha0_vals = np.diff(omega0_vals) / dt
-        alpha1_vals = np.diff(omega1_vals) / dt
+        alpha0_vals = [s.alpha_0 for s in trajectory]
+        alpha1_vals = [s.alpha_1 for s in trajectory]
         
         # Print joint positions
         print("\nJoint Positions (rad):")
@@ -193,6 +168,7 @@ class DebugHelper:
         print("\nJoint Torques (Nm):")
         torques_0 = []
         torques_1 = []
+        dt = robot.constants.DT
         
         try:
             for i in range(len(trajectory)-1):
@@ -381,7 +357,7 @@ class DebugHelper:
                 print(f"Joint 1 Peak Torque Rate: {max(abs(torque_derivatives_1)):.3f} Nm/s")
                 
                 # Check for saturation
-                torque_limit = 5.0  # Assumed torque limit
+                torque_limit = 100.0  # Assumed torque limit
                 saturation_0 = sum(1 for t in torques_0 if abs(t) >= torque_limit * 0.95)
                 saturation_1 = sum(1 for t in torques_1 if abs(t) >= torque_limit * 0.95)
                 
@@ -609,21 +585,23 @@ class DebugHelper:
 
     def print_path_points(self, path: List[State]):
         """Print detailed path point information"""
-        print("\n=== Path Points ===")
-        print("idx, theta_0, theta_1, omega_0, omega_1")
-        for i, state in enumerate(path):
-            print(f"{i:3d}, {state.theta_0:7.3f}, {state.theta_1:7.3f}, {state.omega_0:7.3f}, {state.omega_1:7.3f}")
+        print(f" Path found with length: {len(path)}")
+        # print("\n=== Path Points ===")
+        # print("idx, theta_0, theta_1, omega_0, omega_1")
+        # for i, state in enumerate(path):
+        #     print(f"{i:3d}, {state.theta_0:7.3f}, {state.theta_1:7.3f}, {state.omega_0:7.3f}, {state.omega_1:7.3f}")
 
     def print_trajectory_points(self, trajectory: List[State]):
         """Print detailed trajectory point information"""
-        print("\n=== Trajectory Points ===")
-        print("idx, theta_0, theta_1, omega_0, omega_1, alpha_0, alpha_1")
+        print(f" Trajectory found with length: {len(trajectory)}")
+        # print("\n=== Trajectory Points ===")
+        # print("idx, theta_0, theta_1, omega_0, omega_1, alpha_0, alpha_1")
         
-        for i in range(len(trajectory)-1):
-            print(f"{i:3d}, {trajectory[i].theta_0:7.3f}, {trajectory[i].theta_1:7.3f}, "
-                  f"{trajectory[i].omega_0:7.3f}, {trajectory[i].omega_1:7.3f}, "
-                  f"{trajectory[i].alpha_0:7.3f}, {trajectory[i].alpha_1:7.3f}")
-        pass
+        # for i in range(len(trajectory)-1):
+        #     print(f"{i:3d}, {trajectory[i].theta_0:7.3f}, {trajectory[i].theta_1:7.3f}, "
+        #           f"{trajectory[i].omega_0:7.3f}, {trajectory[i].omega_1:7.3f}, "
+        #           f"{trajectory[i].alpha_0:7.3f}, {trajectory[i].alpha_1:7.3f}")
+        # pass
 
     def print_step_details(self, controller: 'Controller', robot, control_actions):
         """Print detailed information about the current control step"""

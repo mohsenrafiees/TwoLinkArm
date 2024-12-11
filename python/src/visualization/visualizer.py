@@ -109,8 +109,15 @@ class Visualizer:
                 
             elif obstacle.shape == 'rectangle':
                 width, height = obstacle.size
-                left = self.world.robot_origin[0] + obstacle.position[0]
-                top = self.world.robot_origin[1] - (obstacle.position[1] + height)
+                original_width, original_height = self.world.obstacles[self.world.inflated_obstacles.index(obstacle)].size
+                
+                # Calculate the inflation amount
+                width_inflation = (width - original_width) / 2
+                height_inflation = (height - original_height) / 2
+                
+                # Calculate position accounting for the coordinate system and inflation
+                left = self.world.robot_origin[0] + obstacle.position[0] - width_inflation
+                top = self.world.robot_origin[1] - (obstacle.position[1] + original_height) - height_inflation
                 
                 surf = pygame.Surface((int(width), int(height)), pygame.SRCALPHA)
                 pygame.draw.rect(surf, (*self.colors['inflated_obstacle'], 128), surf.get_rect())
@@ -127,7 +134,6 @@ class Visualizer:
                 top = self.world.robot_origin[1] - (obstacle.position[1] + height)
                 pygame.draw.rect(self.screen, self.colors['obstacle'], 
                                pygame.Rect(left, top, width, height))
-
     def display_robot(self, robot: Robot) -> None:
         """
         Render the robot's joints and links.

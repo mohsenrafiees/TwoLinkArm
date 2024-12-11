@@ -52,7 +52,7 @@ class SBPLPlanner(GridBasedPlanner):
                 - successor_cache_size (int): Maximum successors to cache
         """
         super().__init__(robot, world)
-        self.debug_helper = DebugHelper(config.get('debug', True))
+        self.debug_helper = DebugHelper(config.get('debug', False))
         
         # Initialize discrete environment and primitives
         self.discrete_env = DiscreteEnvironment(
@@ -66,6 +66,7 @@ class SBPLPlanner(GridBasedPlanner):
         self.motion_primitives = MotionPrimitives(robot.constants, self.num_angle_primitives, 
                                                 self.num_velocity_primitives)
         self.heuristic_computer = HeuristicComputer(self.discrete_env)
+        self.heuristic_calculated = False # Note: If map changed, heuristic must be recalcualted
         
         # Store configuration
         self.robot = robot
@@ -83,7 +84,7 @@ class SBPLPlanner(GridBasedPlanner):
         self.delta_epsilon = config.get('delta_epsilon', 3.0)
         self.epsilon = self.epsilon_init
         self.max_iterations = config.get('max_iterations', 100000)
-        self.planning_timeout = config.get('planning_timeout', 10.0)
+        self.planning_timeout = config.get('planning_timeout', 60.0)
         self.dist_to_goal = float('inf')
         self.best_cost = float('inf')
 
@@ -135,8 +136,9 @@ class SBPLPlanner(GridBasedPlanner):
             self.debug_helper.log_state("Error: Invalid start/goal states")
             return []
 
-        # Initialize search
-        self.debug_helper.log_state("Precomputing heuristics...")
+        # Initialize search and compute heuristics if needed
+        # Note: This must be calulated once if map is not changed
+        self.debug_helper.log_state("Computing heuristics for goal state...")
         self.heuristic_computer.precompute_heuristic_map(goal_state)
 
         best_solution = None
@@ -173,7 +175,13 @@ class SBPLPlanner(GridBasedPlanner):
             else:
                 self.debug_helper.log_state(f"No solution with ε={epsilon:.3f}")
 
-        return best_solution if best_solution else []
+        if best_solution:
+            if(best_solution[0] == start_state):
+                return best_solution
+            else:
+                best_solution.insert(start_state)
+                return best_solution
+        return []
 
     def _search_with_epsilon(self, start_state: State, goal_state: State, 
                            epsilon: float, start_time: float) -> Optional[List[State]]:
@@ -603,82 +611,122 @@ class DiscreteEnvironment:
 
 class HeuristicComputer:
     """
-    Computes and caches heuristic values for the planning search.
-    
-    Uses Dijkstra's algorithm on a discretized workspace to precompute
-    admissible heuristic values for A* search.
-
-    Attributes:
-        discrete_env (DiscreteEnvironment): Environment discretization
-        heuristic_cache (StateCache): Cache for computed heuristic values
-        distance_maps (Dict): Precomputed distance maps
+    Singleton class that computes and caches heuristic values for the planning search.
     """
+    _instance = None
+    _initialized = False
     
-    def __init__(self, discrete_env: DiscreteEnvironment):
+    def __new__(cls, discrete_env=None):
+        if cls._instance is None:
+            cls._instance = super().__new__(cls)
+        return cls._instance
+    
+    def __init__(self, discrete_env: DiscreteEnvironment = None):
         """
-        Initialize heuristic computer.
-
+        Initialize heuristic computer if not already initialized.
         Args:
             discrete_env (DiscreteEnvironment): Discretized environment
         """
-        self.discrete_env = discrete_env
-        self.heuristic_cache = StateCache()
-        self.distance_maps = {}
-        
+        # Check if we need first-time initialization
+        if not self._initialized:
+            if discrete_env is None:
+                raise ValueError("discrete_env must be provided for first initialization")
+            self.discrete_env = discrete_env
+            self.heuristic_cache = StateCache()
+            self.distance_maps = {}
+            self._initialized = True
+            self.debug_helper = DebugHelper(False)
+            self.debug_helper.log_state("HeuristicComputer initialized for first time")
+            self.cache_stats = {'hits': 0, 'misses': 0}
+        elif discrete_env is not None and discrete_env != self.discrete_env:
+            self.debug_helper.log_state("Warning: Attempting to reinitialize HeuristicComputer with different discrete_env")
+
+    def _state_key(self, state: State) -> tuple:
+        """
+        Create a hashable key for a state with reduced precision to increase cache hits.
+        """
+        return (round(state.theta_0, 3), round(state.theta_1, 3))
+
     def precompute_heuristic_map(self, goal_state: State):
         """
         Precompute heuristic values using Dijkstra's algorithm.
-
         Args:
             goal_state (State): Goal state for heuristic computation
         """
-        # Convert goal state to discrete coordinates
-        goal_cell = (self.discrete_env.continuous_to_discrete(goal_state.theta_0),
-                    self.discrete_env.continuous_to_discrete(goal_state.theta_1))
-        
-        # Create sparse adjacency matrix
-        data, rows, cols = [], [], []
-        N = self.discrete_env.cell_count**2
-        
-        # Build connectivity graph
-        for i in range(self.discrete_env.cell_count):
-            for j in range(self.discrete_env.cell_count):
-                idx = i * self.discrete_env.cell_count + j
-                # Include diagonal connections
-                for di, dj in [(-1,0), (1,0), (0,-1), (0,1), 
-                             (-1,-1), (-1,1), (1,-1), (1,1)]:
-                    ni, nj = i + di, j + dj
-                    if 0 <= ni < self.discrete_env.cell_count and \
-                       0 <= nj < self.discrete_env.cell_count:
-                        nidx = ni * self.discrete_env.cell_count + nj
-                        cost = np.sqrt(di*di + dj*dj)
-                        data.append(cost)
-                        rows.append(idx)
-                        cols.append(nidx)
-        
-        # Compute distances using Dijkstra's algorithm
-        matrix = sparse.csr_matrix((data, (rows, cols)), shape=(N, N))
-        start_idx = goal_cell[0] * self.discrete_env.cell_count + goal_cell[1]
-        distances = dijkstra(matrix, indices=start_idx)
-        
-        # Store reshaped distance map
-        self.distance_maps[goal_state] = distances.reshape(
-            self.discrete_env.cell_count,
-            self.discrete_env.cell_count
-        )
-    
+        if not self._initialized:
+            raise RuntimeError("HeuristicComputer not properly initialized")
+
+        # Create hashable key for goal state
+        goal_key = self._state_key(goal_state)
+
+        # Check if we already have computed this goal state
+        if goal_key in self.distance_maps:
+            self.debug_helper.log_state(f"Reusing cached heuristic map for goal {goal_key}")
+            self.cache_stats['hits'] += 1
+            return
+
+        try:
+            self.debug_helper.log_state(f"Computing new heuristic map for goal {goal_key}")
+            self.cache_stats['misses'] += 1
+            
+            # Convert goal state to discrete coordinates
+            goal_cell = (self.discrete_env.continuous_to_discrete(goal_state.theta_0),
+                        self.discrete_env.continuous_to_discrete(goal_state.theta_1))
+            
+            # Create sparse adjacency matrix
+            data, rows, cols = [], [], []
+            N = self.discrete_env.cell_count**2
+            
+            # Build connectivity graph
+            for i in range(self.discrete_env.cell_count):
+                for j in range(self.discrete_env.cell_count):
+                    idx = i * self.discrete_env.cell_count + j
+                    # Include diagonal connections
+                    for di, dj in [(-1,0), (1,0), (0,-1), (0,1), 
+                                 (-1,-1), (-1,1), (1,-1), (1,1)]:
+                        ni, nj = i + di, j + dj
+                        if 0 <= ni < self.discrete_env.cell_count and \
+                           0 <= nj < self.discrete_env.cell_count:
+                            nidx = ni * self.discrete_env.cell_count + nj
+                            cost = np.sqrt(di*di + dj*dj)
+                            data.append(cost)
+                            rows.append(idx)
+                            cols.append(nidx)
+            
+            # Compute distances using Dijkstra's algorithm
+            matrix = sparse.csr_matrix((data, (rows, cols)), shape=(N, N))
+            start_idx = goal_cell[0] * self.discrete_env.cell_count + goal_cell[1]
+            distances = dijkstra(matrix, indices=start_idx)
+            
+            if distances is None:
+                raise ValueError("Dijkstra's algorithm failed to compute distances")
+
+            # Store reshaped distance map using the key
+            self.distance_maps[goal_key] = distances.reshape(
+                self.discrete_env.cell_count,
+                self.discrete_env.cell_count
+            )
+            
+            self.debug_helper.log_state(f"Cache stats - Hits: {self.cache_stats['hits']}, Misses: {self.cache_stats['misses']}")
+            
+        except Exception as e:
+            self.debug_helper.log_state(f"Error computing heuristic map: {str(e)}")
+            raise RuntimeError(f"Failed to compute heuristic map: {str(e)}")
+
     def get_heuristic(self, state: State, goal_state: State) -> float:
         """
         Get heuristic value for a state pair.
-
         Args:
             state (State): Current state
             goal_state (State): Goal state
-
         Returns:
             float: Heuristic estimate of cost to goal
         """
-        cache_key = (state, goal_state)
+        # Create hashable keys
+        state_key = self._state_key(state)
+        goal_key = self._state_key(goal_state)
+        
+        cache_key = (state_key, goal_key)
         cached = self.heuristic_cache.get(cache_key)
         if cached is not None:
             return cached
@@ -687,11 +735,15 @@ class HeuristicComputer:
         state_cell = (self.discrete_env.continuous_to_discrete(state.theta_0),
                      self.discrete_env.continuous_to_discrete(state.theta_1))
         
-        value = self.distance_maps[goal_state][state_cell[0], state_cell[1]]
-        self.heuristic_cache.put(cache_key, value)
-        return value
-
-
+        try:
+            value = self.distance_maps[goal_key][state_cell[0], state_cell[1]]
+            self.heuristic_cache.put(cache_key, value)
+            return value
+        except KeyError:
+            self.debug_helper.log_state(f"Warning: No distance map found for goal {goal_key}")
+            # Fallback to Euclidean distance if no precomputed map
+            return np.sqrt((state.theta_0 - goal_state.theta_0)**2 + 
+                         (state.theta_1 - goal_state.theta_1)**2)
 class StateCache:
     """
     Cache implementation for storing computed states and values.

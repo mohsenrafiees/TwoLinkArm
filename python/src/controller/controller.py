@@ -39,6 +39,7 @@ class Controller:
         self.path: List[State] = []         # Current trajectory
         self.coarse_path: List[State] = []  # Initial path before optimization
         self.path_index = 0                 # Current position in trajectory
+        self.time_index = 0
         self.planning_timeout = 500.0       # Maximum planning time (ms)
         
         # Goal handling
@@ -77,6 +78,7 @@ class Controller:
             
         try:
             # Get reference state and compute control
+            self.time_index += 1
             ref_state = self.path[self.path_index]
             theta_ref = (ref_state.theta_0, ref_state.theta_1)
             tau_0, tau_1 = self.mpc.step(theta_ref, robot, self.is_moving_goal)
@@ -162,7 +164,7 @@ class Controller:
         self.planning_mode = True
         self.plan_start_time = time.time()
         
-        try:    
+        try:  
             # Check if goal is obstructed and find alternative if needed
             actual_goal = self.find_closest_unobstructed_goal(robot, goal)
             if actual_goal != goal:
@@ -171,6 +173,8 @@ class Controller:
             
             # Get start position and plan path
             start_pos = robot.joint_2_pos()
+            self.debug_helper.log_state(f"Planning from {start_pos} to {goal}")
+            self.debug_helper.log_state("<======== Path Planning Started ========>")
             coarse_path = self.planner.Plan(start_pos, actual_goal, final_velocities)
 
             if len(coarse_path) < 2:
@@ -180,15 +184,17 @@ class Controller:
 
             # Store coarse path and debug info
             self.coarse_path = coarse_path
-            self.debug_helper.print_path_stats(coarse_path, robot)
             self.debug_helper.print_path_points(coarse_path)
+            self.debug_helper.print_path_stats(coarse_path, robot)
             self.debug_helper.validate_path_limits(coarse_path, robot)
             
             # Generate time-optimal trajectory
             self.mpc.robot = robot
             trajectory_planner = TimeOptimalTrajectoryGenerator(robot, coarse_path)
+            self.debug_helper.log_state("<======== Trajectory Generation Started ========>")
             path = trajectory_planner.generate_trajectory(coarse_path)
             self.debug_helper.print_trajectory_points(path)
+            self.debug_helper.print_trajectory_stats(path, robot)
             
             if not path:
                 # Calculate distance between goal and last path point
@@ -273,47 +279,136 @@ class Controller:
         """
         return np.arctan2(np.sin(angle), np.cos(angle))
 
+    
+    # TODO: Implement a robust algorithm
     def _update_path_index(self, robot: 'Robot') -> None:
         """
-        Update path index based on closest configuration in joint space.
-
+        Update path index using a simplified approach that ensures quick updates
+        and allows robot to reach target velocities.
+        
         Args:
-            robot: Current robot state
+            robot: Current robot state containing position and joint velocities
         """
-        if not self.path or self.path_index >= len(self.path):
-            return
-                
         try:
-            current_theta_0 = robot.theta_0
-            current_theta_1 = robot.theta_1
-            
-            # Find closest configuration within look-ahead window
-            min_dist = float('inf')
-            closest_idx = self.path_index
-            look_ahead_window = min(1, len(self.path) - self.path_index)
-            
-            for i in range(self.path_index, 
-                          min(self.path_index + look_ahead_window, len(self.path))):
-                delta_theta_0 = self._normalize_angle(self.path[i].theta_0 - current_theta_0)
-                delta_theta_1 = self._normalize_angle(self.path[i].theta_1 - current_theta_1)
+            if not self.path or self.path_index >= len(self.path):
+                return
                 
-                dist = np.sqrt(delta_theta_0**2 + delta_theta_1**2)
+            current_pos = robot.joint_2_pos()
+            
+            # Get current reference point position
+            current_ref_pos = robot.forward_kinematics(
+                self.path[self.path_index].theta_0,
+                self.path[self.path_index].theta_1
+            )
+            
+            # Distance to current reference point
+            dist_to_current = np.hypot(
+                current_pos[0] - current_ref_pos[0],
+                current_pos[1] - current_ref_pos[1]
+            )
+            
+            # Look ahead a few points to find better reference
+            look_ahead = min(3, len(self.path) - self.path_index)
+            best_idx = self.path_index
+            min_dist = dist_to_current
+            
+            for i in range(self.path_index + 1, self.path_index + look_ahead):
+                if i >= len(self.path):
+                    break
+                    
+                path_pos = robot.forward_kinematics(
+                    self.path[i].theta_0,
+                    self.path[i].theta_1
+                )
+                
+                dist = np.hypot(
+                    current_pos[0] - path_pos[0],
+                    current_pos[1] - path_pos[1]
+                )
+                
+                # Update if we find a closer point
                 if dist < min_dist:
                     min_dist = dist
-                    closest_idx = i
+                    best_idx = i
             
-            # Update index if making forward progress
-            if closest_idx > self.path_index:
-                self.path_index = closest_idx
-            else:
-                self.path_index = min(self.path_index + 1, len(self.path) - 1)
-                
-            self.mpc.set_path_index(self.path_index)
-            
+            # Update index if we found a better point or if we're close enough to current
+            if best_idx > self.path_index or self.time_index > self.path_index:
+                self.path_index = min(best_idx + 1, len(self.path) - 1)
+                self.mpc.set_path_index(self.path_index)                
         except Exception as e:
             self.debug_helper.log_state(f"Error in path index update: {str(e)}")
             self.path_index = min(self.path_index + 1, len(self.path) - 1)
             self.mpc.set_path_index(self.path_index)
+    # def _update_path_index(self, robot: 'Robot') -> None:
+        """
+        Update path index to next point when robot is close enough to current point.
+        Maintains current index if robot is too far from current point.
+        
+        Args:
+            robot: Current robot state containing position
+        """
+        # try:
+        #     if not self.path or self.path_index >= len(self.path) - 1:  # Check if we're at end
+        #         return
+                
+        #     current_pos = robot.joint_2_pos()
+        #     current_path_pos = robot.forward_kinematics(
+        #         self.path[self.path_index].theta_0,
+        #         self.path[self.path_index].theta_1
+        #     )
+
+
+
+        #     current_pos = robot.joint_2_pos()
+        #     current_path_pos = robot.forward_kinematics(
+        #         self.path[self.path_index].theta_0,
+        #         self.path[self.path_index].theta_1
+        #     )
+            
+        #     # Get vector from current position to path point
+        #     path_vector = np.array([
+        #         current_path_pos[0] - current_pos[0],
+        #         current_path_pos[1] - current_pos[1]
+        #     ])
+            
+           
+                
+        #     # Compute end-effector velocity using Jacobian
+        #     th0, th1 = robot.theta_0, robot.theta_1
+        #     l1, l2 = robot.constants.LINK_1, robot.constants.LINK_2
+            
+        #     J = np.array([
+        #         [-l1*np.sin(th0) - l2*np.sin(th0 + th1), -l2*np.sin(th0 + th1)],
+        #         [l1*np.cos(th0) + l2*np.cos(th0 + th1), l2*np.cos(th0 + th1)]
+        #     ])
+            
+        #     joint_velocities = np.array([robot.omega_0, robot.omega_1])
+        #     ee_velocity = J @ joint_velocities
+            
+        #     # If robot is behind path point (velocity points towards path point)
+        #     # and distance is significant, maintain current index
+        #     if  np.dot(path_vector, ee_velocity) > 0 and np.linalg.norm(path_vector) > 100:
+        #         self.mpc.set_path_index(self.path_index)
+        #         self.debug_helper.log_state(f"pose is behind, remaining at current index{self.mpc.path_index}")
+        #         return
+
+
+
+            
+        #     # Calculate distance to current target point
+        #     dist_to_current = np.hypot(
+        #         current_pos[0] - current_path_pos[0],
+        #         current_pos[1] - current_path_pos[1]
+        #     )
+            
+        #     # If close enough to current point, move to next point
+        #     if dist_to_current <= 10.0:  # Threshold for "close enough"
+        #         self.path_index += 1
+        #         self.mpc.set_path_index(self.path_index)
+        #         self.debug_helper.log_state(f"path index updated to {self.mpc.path_index}")
+                
+        # except Exception as e:
+        #     self.debug_helper.log_state(f"Error in path index update: {str(e)}")
 
     def _update_tracking_history(self, robot: 'Robot') -> None:
         """

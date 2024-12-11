@@ -31,7 +31,7 @@ class TimeOptimalTrajectoryGenerator:
         """
         self.robot = robot
         self.tolerance = 1e-4  # Numerical tolerance for optimization
-        self.debug = DebugHelper(debug=True)
+        self.debug = DebugHelper(debug=False)
         self.debug.print_trajectory_header()
         self.path = PathParameterizer(path_points)
         self.cached_dynamics = {}
@@ -727,6 +727,8 @@ class TimeOptimalTrajectoryGenerator:
             switch_points = self.find_switch_points()
             
             # Determine maximum valid path parameter
+            # Note: solver may find incomplete solution(max_valid_s < 1.0, ideallly max_valid_s ~ 1.0)
+            # TODO: Handle tarjectory genration for s > max_valid_s
             max_valid_s = 0.0
             if switch_points:
                 max_valid_s = switch_points[-1][0]
@@ -750,19 +752,15 @@ class TimeOptimalTrajectoryGenerator:
             
             # Define adaptive number of base points based on path length
             # Use minimum of 20 points for very short paths
-            min_points = 10
-            max_points = 50
-            num_base_points = min_points
-            if path_length <= 50.0:
-                num_base_points = min_points
-            elif path_length > 50.0 and path_length <= 150.0:
-                num_base_points = 20
-            elif path_length > 150.0 and path_length <= 250:
-                num_base_points = 30
-            elif path_length > 250.0 and path_length < 350:
-                num_base_points = 40
-            else:
-                num_base_points = max_points
+            num_base_points = max(20, int(path_length / 2))
+            num_base_points = min(num_base_points, 100)
+            # min_points = 30
+            # max_points = 100
+            # num_base_points = min_points
+            # if path_length <= 50.0:
+            #     num_base_points = min_points
+            # else:
+            #     num_base_points = max_points
 
             self.debug.log_state(f"Using {num_base_points} base points for trajectory")
 
@@ -871,5 +869,6 @@ class TimeOptimalTrajectoryGenerator:
                 cleaned_path.append(current_point)
                 prev_point = current_point
                 
-        print(f"Path preprocessing: removed {len(path_points) - len(cleaned_path)} duplicate points")
+        self.debug.log_state(f"Path preprocessing: removed {len(path_points) - len(cleaned_path)} duplicate points")
+
         return cleaned_path

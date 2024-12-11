@@ -132,7 +132,7 @@ class Runner:
             # Handle goal updates for moving target simulation
             if (is_moving_goal and current_time - goal_change_time > 0 
                 and not self.goal_change_received):
-                self.debug_helper.log_state("Initiating graceful stop")
+                # self.debug_helper.log_state("Initiating graceful stop")
                 self.controller.initiate_graceful_stop(self.robot)
                 
                 # Generate new target position
@@ -140,8 +140,6 @@ class Runner:
                     self.constants.min_reachable_radius(),
                     self.constants.max_reachable_radius())
                 self.goal_change_received = True
-                self.debug_helper.log_state(
-                    f"current: {current_time}, goal_change_time: {goal_change_time}")
                     
             # Handle transition to new goal after stop
             if (is_moving_goal and self.goal_change_received 

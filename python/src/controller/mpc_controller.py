@@ -39,6 +39,7 @@ class MPCController:
         
         # Reference trajectory storage
         self.path: List[State] = []
+        self.path_index = 0
         
         # Initialize debug helper
         self.debug_helper = DebugHelper(debug=True)
@@ -106,6 +107,7 @@ class MPCController:
             Tuple[float, float]: Synthetic control inputs (v₀, v₁)
         """
         # Compute control law: v = k₁(θᵣ - θ) - k₂θ̇
+        # Compute errors
         v1 = self.k1 * (theta_ref[0] - theta[0]) - self.k2 * theta_dot[0]
         v2 = self.k1 * (theta_ref[1] - theta[1]) - self.k2 * theta_dot[1]
         
@@ -167,7 +169,7 @@ class MPCController:
             current_state, reference_trajectory, steps_in_horizon)
         
         # Get control action
-        ref_state = self.path[self.get_current_path_index()]
+        ref_state = self.path[self.path_index]
         v =  control_sequence[0]
         
         # Compute and apply torques
@@ -188,7 +190,6 @@ class MPCController:
         self.theta_actual_history.clear()
         self.v_history.clear()
         self.tau_history.clear()
-        self.path_index = 0
 
     def set_path(self, path: List[State]) -> None:
         """
@@ -209,50 +210,40 @@ class MPCController:
         """
         self.path_index = path_index
 
-    def get_current_path_index(self) -> int:
-        """
-        Get current path index with bounds checking.
+    # def get_current_path_index(self) -> int:
+    #     """
+    #     Get current path index with bounds checking.
 
-        Returns:
-            int: Current valid path index
-        """
-        return min(self.path_index, len(self.path) - 1) if self.path else 0
+    #     Returns:
+    #         int: Current valid path index
+    #     """
+    #     return min(self.path_index, len(self.path) - 1) if self.path else 0
 
-    def update_path_index(self, robot: Robot) -> None:
-        """
-        Update path index based on tracking progress.
-
-        Args:
-            robot: Current robot state
-        """
-        if not self.path:
-            return
-
-        current_pos = robot.joint_2_pos()
-        look_ahead = min(1, len(self.path) - self.path_index)
-        min_dist = float('inf')
-        best_idx = self.path_index
+    #     current_pos = robot.joint_2_pos()
+    #     look_ahead = min(1, len(self.path) - self.path_index)
+    #     min_dist = float('inf')
+    #     best_idx = self.path_index
         
-        # Find closest point within look-ahead window
-        for i in range(self.path_index, self.path_index + look_ahead):
-            if i >= len(self.path):
-                break
+    #     # Find closest point within look-ahead window
+    #     for i in range(self.path_index, self.path_index + look_ahead):
+    #         if i >= len(self.path):
+    #             break
                 
-            path_pos = robot.forward_kinematics(
-                self.path[i].theta_0,
-                self.path[i].theta_1
-            )
+    #         path_pos = robot.forward_kinematics(
+    #             self.path[i].theta_0,
+    #             self.path[i].theta_1
+    #         )
             
-            dist = np.hypot(current_pos[0] - path_pos[0],
-                          current_pos[1] - path_pos[1])
+    #         dist = np.hypot(current_pos[0] - path_pos[0],
+    #                       current_pos[1] - path_pos[1])
             
-            if dist < min_dist:
-                min_dist = dist
-                best_idx = i
+    #         if dist < min_dist:
+    #             min_dist = dist
+    #             best_idx = i
         
-        # Update index if making forward progress
-        if best_idx > self.path_index:
-            self.path_index = best_idx
+    #     # Update index if making forward progress
+    #     if best_idx > self.path_index:
+    #         self.path_index = best_idx
 
     def _log_initialization(self) -> None:
         """Log controller initialization parameters."""
@@ -271,7 +262,7 @@ class MPCController:
             List[Tuple[float, float]]: Reference trajectory points
         """
         reference_trajectory = []
-        current_path_index = self.get_current_path_index()
+        current_path_index = self.path_index #self.get_current_path_index()
         
         for i in range(steps_in_horizon):
             path_idx = min(current_path_index + i, len(self.path) - 1)

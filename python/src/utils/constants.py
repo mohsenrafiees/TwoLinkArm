@@ -67,7 +67,7 @@ class RobotConstants:
         
         # Discretization parameters
         self.VELOCITY_RESOLUTION = config['velocity_resolution']
-        self.DT = config['dt']
+        self.DT = config.get('dt', 0.01)
         self.THETA_0_RESOLUTION = config.get('theta_0_resolution', 0.1)
         self.THETA_1_RESOLUTION = config.get('theta_1_resolution', 0.1)
         

@@ -31,8 +31,8 @@ def main() -> None:
     robot_constants = RobotConstants(config['robot'])
     # Initialize obstacles
     obstacles = [Obstacle(**obs) for obs in config['world'].get('obstacles', [])]
-    circle_obstacle = generate_random_circle_obstacle(config['world']['width'], 30.0)
-    obstacles.append(circle_obstacle)
+    # circle_obstacle = generate_random_circle_obstacle(config['world']['width'], 30.0)
+    # obstacles.append(circle_obstacle)
     # Initialize world
     world = World(
         config['world']['width'],
