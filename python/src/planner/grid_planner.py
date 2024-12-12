@@ -44,52 +44,6 @@ class GridBasedPlanner(Planner):
             items = list(self.collision_cache.items())
             self.collision_cache = dict(items[-self.max_cache_size:])
 
-    # def discretize_state(self, state: Tuple[float, float]) -> Tuple[float, float]:
-    #     """
-    #     Discretize continuous joint angles with adaptive resolution based on obstacle proximity.
-
-    #     Args:
-    #         state (Tuple[float, float]): Continuous joint angles (theta_0, theta_1)
-
-    #     Returns:
-    #         Tuple[float, float]: Discretized joint angles
-    #     """
-    #     theta_0, theta_1 = state
-    #     current_pos = self.robot.forward_kinematics(theta_0, theta_1)
-    #     min_obstacle_dist = self._get_min_obstacle_distance(current_pos)
-        
-    #     # Adjust discretization resolution based on proximity to obstacles
-    #     base_resolution = self.resolutions[0]
-    #     resolution = base_resolution / 2 if min_obstacle_dist < 10.0 else base_resolution * 2
-            
-    #     discrete_theta_0 = round(theta_0 / resolution) * resolution
-    #     discrete_theta_1 = round(theta_1 / resolution) * resolution
-        
-    #     return (discrete_theta_0, discrete_theta_1)
-
-    # def _get_min_obstacle_distance(self, pos: Tuple[float, float]) -> float:
-    #     """
-    #     Calculate minimum distance from a point to any obstacle in the workspace.
-
-    #     Args:
-    #         pos (Tuple[float, float]): Position to check in workspace coordinates
-
-    #     Returns:
-    #         float: Distance to nearest obstacle
-    #     """
-    #     min_dist = float('inf')
-    #     for obstacle in self.world.inflated_obstacles:
-    #         if obstacle.shape == 'circle':
-    #             dist = np.hypot(pos[0] - obstacle.position[0], 
-    #                           pos[1] - obstacle.position[1]) - obstacle.size
-    #         else:
-    #             # Handle rectangular obstacles
-    #             dx = max(abs(pos[0] - obstacle.position[0]) - obstacle.size[0]/2, 0)
-    #             dy = max(abs(pos[1] - obstacle.position[1]) - obstacle.size[1]/2, 0)
-    #             dist = np.hypot(dx, dy)
-    #         min_dist = min(min_dist, dist)
-    #     return min_dist
-
     def heuristic(self, current: State, goal: State) -> float:
         """
         Calculate heuristic cost between current and goal states using a weighted combination
